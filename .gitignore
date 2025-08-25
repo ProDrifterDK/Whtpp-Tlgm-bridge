@@ -1,0 +1,22 @@
+# Environment files
+.env
+
+# Python cache and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+dist/
+build/
+
+# Playwright browsers
+playwright_env/
+
+# Docker-compose override files
+docker-compose.override.yml
+
+# Temporary files
+downloads/
+*.tmp
+*.log

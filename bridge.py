@@ -1,17 +1,26 @@
 import asyncio
+import os
 from playwright.async_api import async_playwright
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import ContentType
+from dotenv import load_dotenv
 
-HEADLESS = False
-TELEGRAM_TOKEN = 'TU_TOKEN_DE_TELEGRAM'
-TELEGRAM_CHAT_ID = 'TU_ID_DE_CHAT_DE_TELEGRAM'
+# Load environment variables
+load_dotenv()
+
+# Replace hardcoded values
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+HEADLESS = os.getenv("HEADLESS", "False").lower() in ("true", "1", "yes")
 
 # Selectors for WhatsApp Web
 SEARCH_BOX = "[data-testid='chat-list-search']"
 CHAT_RESULT = "[data-testid='chat-list-item']"
 MESSAGE_INPUT = "[contenteditable='true'][title='Type a message']"
 SEND_BUTTON = "button[aria-label='Send']"
+ATTACH_BUTTON = "div[title='Attach']"
+PHOTO_BUTTON = "li[data-testid='photo-video']"
+DOCUMENT_BUTTON = "li[data-testid='document']"
 
 state_map = {}
 message_queue = asyncio.Queue()
@@ -25,6 +34,16 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
             headless=HEADLESS,
             args=["--disable-notifications"]
         )
+        
+        # Browser close handler
+        def handle_close(browser_context):
+            asyncio.create_task(
+                message_queue.put(('status', {
+                    "text": f"CRITICAL: {account_id} disconnected!"
+                }))
+            )
+        browser.on("close", handle_close)
+        
         page = await browser.new_page()
         await page.goto('https://web.whatsapp.com/')
         
@@ -33,13 +52,26 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
         while True:
             try:
                 response_msg = response_queue.get_nowait()
-                # Playwright steps to send message
-                await page.locator(SEARCH_BOX).fill(response_msg["chat_target"])
-                await page.locator(CHAT_RESULT).first.click()
-                await page.locator(MESSAGE_INPUT).fill(response_msg["text"])
-                await page.locator(SEND_BUTTON).click()
+                if response_msg["type"] == "text":
+                    await page.locator(SEARCH_BOX).fill(response_msg["chat_target"])
+                    await page.locator(CHAT_RESULT).first.click()
+                    await page.locator(MESSAGE_INPUT).fill(response_msg["text"])
+                    await page.locator(SEND_BUTTON).click()
+                elif response_msg["type"] == "media":
+                    await page.locator(SEARCH_BOX).fill(response_msg["chat_target"])
+                    await page.locator(CHAT_RESULT).first.click()
+                    async with page.expect_file_chooser() as fc_info:
+                        await page.locator(ATTACH_BUTTON).click()
+                        await page.locator(DOCUMENT_BUTTON if response_msg["file_type"] == "document" else PHOTO_BUTTON).click()
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(response_msg["file_path"])
+                    await asyncio.sleep(0.5)
+                    await page.locator(SEND_BUTTON).click()
+                    os.remove(response_msg["file_path"])
             except asyncio.QueueEmpty:
                 pass
+            except Exception as e:
+                print(f"Error sending message ({account_id}): {str(e)}")
 
             try:
                 new_msg_selector = 'div[aria-label="Message list"] div[tabindex="-1"]:not([data-processed])'
@@ -53,43 +85,125 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
 
                         sender = await sender_el.get_attribute('title')
                         msg_text_el = await msg.query_selector('[data-testid="msg-container"] div.selectable-text')
-                        msg_text = await msg_text_el.inner_text() if msg_text_el else '<media>'
-
-                        formatted = f'[{account_id}] De {sender}: {msg_text}'
-                        await message_queue.put(('whatsapp', formatted, account_id, sender))
+                        
+                        # Check for media
+                        file_path = None
+                        file_type = None
+                        download_btn = None
+                        if await msg.query_selector("img"):
+                            file_type = "photo"
+                            download_btn = await msg.query_selector("img")
+                        elif await msg.query_selector("[data-testid='document']"):
+                            file_type = "document"
+                            download_btn = await msg.query_selector("[data-testid='document']")
+                        
+                        if download_btn:
+                            async with page.expect_download() as download_info:
+                                await download_btn.click()
+                            download = await download_info.value
+                            file_path = f"./downloads/{download.suggested_filename}"
+                            await download.save_as(file_path)
+                            
+                            await message_queue.put(('whatsapp', {
+                                "type": "media",
+                                "file_path": file_path,
+                                "file_type": file_type,
+                                "account_id": account_id,
+                                "sender": sender
+                            }))
+                        else:
+                            msg_text = await msg_text_el.inner_text() if msg_text_el else '<media>'
+                            await message_queue.put(('whatsapp', {
+                                "type": "text",
+                                "text": f'[{account_id}] De {sender}: {msg_text}',
+                                "account_id": account_id,
+                                "sender": sender
+                            }))
             except Exception as e:
-                print(f"Error in WhatsApp listener ({account_id}): {str(e)}")
+                print(f"Error processing message ({account_id}): {str(e)}")
                 await asyncio.sleep(5)
 
-            # Short sleep to prevent CPU overload
             await asyncio.sleep(0.1)
 
 async def telegram_bot_main(response_queues):
     bot = Bot(token=TELEGRAM_TOKEN)
-    storage = MemoryStorage()
-    dp = Dispatcher(bot, storage=storage)
+    dp = Dispatcher(bot=bot, storage=None)
     
-    @dp.message_handler()
-    async def handle_message(message: types.Message):
+    @dp.message(commands=['start', 'help'])
+    async def send_welcome(message: types.Message):
+        await message.reply("Bienvenido al puente WhatsApp-Telegram. Responde a un mensaje para enviar una respuesta a WhatsApp.")
+    
+    @dp.message()
+    async def handle_text(message: types.Message):
         if message.reply_to_message and message.reply_to_message.message_id in state_map:
             state = state_map[message.reply_to_message.message_id]
             response_msg = {
                 "chat_target": state["chat_original"],
-                "text": message.text
+                "text": message.text,
+                "type": "text"
             }
             await response_queues[state["account"]].put(response_msg)
         else:
             await message.reply("Por favor responde a un mensaje para enviar la respuesta.")
     
+    @dp.message(content_types=[ContentType.PHOTO, ContentType.DOCUMENT])
+    async def handle_media(message: types.Message):
+        if message.reply_to_message and message.reply_to_message.message_id in state_map:
+            state = state_map[message.reply_to_message.message_id]
+            
+            if message.photo:
+                file_id = message.photo[-1].file_id
+                file_type = "photo"
+            elif message.document:
+                file_id = message.document.file_id
+                file_type = "document"
+            else:
+                return
+            
+            file = await bot.get_file(file_id)
+            if not file.file_path:
+                return  # Skip if no file path
+
+            file_name = file.file_path.split('/')[-1]
+            file_path = f"./downloads/{file_name}"
+            await bot.download_file(file.file_path, destination=file_path)
+            
+            await response_queues[state["account"]].put({
+                "type": "media",
+                "file_path": file_path,
+                "file_type": file_type,
+                "chat_target": state["chat_original"]
+            })
+    
     async def queue_consumer():
         while True:
-            source, content, account_id, chat_original = await message_queue.get()
+            source, content = await message_queue.get()
             if source == 'whatsapp':
-                sent_msg = await bot.send_message(TELEGRAM_CHAT_ID, content, reply_markup=None)
-                state_map[sent_msg.message_id] = {
-                    'account': account_id,
-                    'chat_original': chat_original
-                }
+                if content["type"] == "text":
+                    sent_msg = await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
+                    state_map[sent_msg.message_id] = {
+                        'account': content["account_id"],
+                        'chat_original': content["sender"]
+                    }
+                elif content["type"] == "media":
+                    file = types.FSInputFile(content["file_path"])
+                    sent_msg = None
+                    if content["file_type"] == "photo":
+                        sent_msg = await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=file)
+                    elif content["file_type"] == "document":
+                        sent_msg = await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=file)
+                    
+                    if sent_msg:
+                        state_map[sent_msg.message_id] = {
+                            'account': content["account_id"],
+                            'chat_original': content["sender"]
+                        }
+                    os.remove(content["file_path"])
+                elif content["type"] == "status":
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
+    
+    # Create downloads directory
+    os.makedirs("./downloads", exist_ok=True)
     
     await asyncio.gather(
         dp.start_polling(),
