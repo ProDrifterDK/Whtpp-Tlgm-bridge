@@ -1,0 +1,13 @@
+# Ignore everything by default to enforce an explicit allow-list.
+# This is the most robust strategy.
+**
+
+# Allow the essential configuration files for Docker.
+!Dockerfile
+!docker-compose.yml
+
+# Allow application source code. Adjust if your code is in a different directory.
+!src/
+
+# Allow dependency manifests. Add others if needed (e.g., package.json).
+!requirements.txt

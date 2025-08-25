@@ -1,9 +1,20 @@
-version: '3'
+version: '3.8'
+
 services:
   bridge:
     build: .
+    container_name: whtpp_tlgm_bridge_app
+    restart: unless-stopped
     volumes:
+      # 1. Montaje del código fuente para desarrollo en vivo:
+      # Mapea el directorio actual (.) de tu PC a /app en el contenedor.
+      # Cualquier cambio que hagas en bridge.py se reflejará al instante.
+      - ./:/app
+
+      # 2. Volúmenes para datos persistentes (estos ya los tenías bien):
+      # Se aseguran de que los datos no se pierdan cuando el contenedor se reinicie.
       - ./user_data:/app/user_data
       - ./downloads:/app/downloads
+      
+      # 3. Montaje del archivo de entorno:
       - ./.env:/app/.env
-    restart: unless-stopped
