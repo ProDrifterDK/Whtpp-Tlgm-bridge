@@ -678,7 +678,60 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                                         print(f"[{account_id}] ❌ Text selector {j+1} failed: {text_error}")
                                         continue
                                 
-                                if msg_text and msg_text.strip():
+                                # DIAGNOSTIC: Check for multimedia content before processing as text
+                                print(f"[{account_id}] 🔍 MULTIMEDIA CHECK: Looking for images/media in message {msg_index + 1}...")
+                                
+                                # Check for images
+                                image_selectors = [
+                                    'div[aria-label="Abrir foto"]',              # Spanish: Open photo
+                                    'div[aria-label="Open photo"]',              # English: Open photo
+                                    'img[src*="blob:"]',                         # Blob URLs (WhatsApp images)
+                                    'img[src^="data:image"]',                    # Data URIs (thumbnails)
+                                    'div[role="button"][aria-label*="foto"]',    # Photo button (Spanish)
+                                    'div[role="button"][aria-label*="photo"]',   # Photo button (English)
+                                ]
+                                
+                                has_image = False
+                                image_src = None
+                                
+                                for img_selector in image_selectors:
+                                    try:
+                                        img_element = await msg.query_selector(img_selector)
+                                        if img_element:
+                                            print(f"[{account_id}] 🖼️ FOUND IMAGE with selector: {img_selector}")
+                                            # Try to get image source
+                                            if 'img' in img_selector:
+                                                image_src = await img_element.get_attribute('src')
+                                            else:
+                                                # Look for img inside the div
+                                                inner_img = await img_element.query_selector('img')
+                                                if inner_img:
+                                                    image_src = await inner_img.get_attribute('src')
+                                            
+                                            if image_src:
+                                                print(f"[{account_id}] 📸 Image source: {image_src[:100]}...")
+                                                has_image = True
+                                                break
+                                    except Exception as img_error:
+                                        print(f"[{account_id}] ⚠️ Image selector {img_selector} failed: {img_error}")
+                                        continue
+                                
+                                if has_image and image_src:
+                                    print(f"[{account_id}] 🎯 PROCESSING AS IMAGE MESSAGE")
+                                    message_data = {
+                                        "type": "media",
+                                        "file_type": "photo",
+                                        "file_src": image_src,
+                                        "caption": f'[{account_id}] 📸 Imagen de {sender_name}',
+                                        "account_id": account_id,
+                                        "sender": sender_name
+                                    }
+                                    print(f"[{account_id}] 📤 [QUEUE] Adding image message to queue: {message_data}")
+                                    await message_queue.put(('whatsapp', message_data))
+                                    print(f"[{account_id}] 📤 [QUEUE] ✅ Image message added to queue successfully")
+                                
+                                elif msg_text and msg_text.strip():
+                                    print(f"[{account_id}] 📝 PROCESSING AS TEXT MESSAGE")
                                     print(f"[{account_id}] ✅ FOUND MESSAGE from {sender_name}: {msg_text[:50]}...")
                                     message_data = {
                                         "type": "text",
@@ -690,11 +743,11 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                                     await message_queue.put(('whatsapp', message_data))
                                     print(f"[{account_id}] 📤 [QUEUE] ✅ Message added to queue successfully")
                                 else:
-                                    print(f"[{account_id}] ❌ FAILED to extract text from message {msg_index + 1}")
+                                    print(f"[{account_id}] ❌ FAILED to extract text or media from message {msg_index + 1}")
                                     # DIAGNOSTIC: Log message element structure
                                     try:
                                         outer_html = await msg.evaluate('el => el.outerHTML')
-                                        print(f"[{account_id}] 🔬 Message {msg_index + 1} HTML structure: {outer_html[:200]}...")
+                                        print(f"[{account_id}] 🔬 Message {msg_index + 1} HTML structure: {outer_html[:500]}...")
                                     except:
                                         pass
                                     
@@ -759,7 +812,7 @@ async def telegram_bot_main(response_queues):
     
     @dp.message(Command(commands=["start", "help"]))
     async def send_welcome(message: types.Message):
-        await message.reply("Bienvenido al puente WhatsApp-Telegram. Responde a un mensaje para enviar una respuesta a WhatsApp.")
+        await message.reply("Bienvenido al puente WhatsApp-Telegram. Responde a un mensaje para enviar una respuesta a WhatsApp en el chat correspondiente.")
     
     @dp.message()
     async def handle_text(message: types.Message):
@@ -943,12 +996,37 @@ async def telegram_bot_main(response_queues):
                         print(f"📤 [TELEGRAM] Sending media message to Telegram...")
                         print(f"🐛 [DEBUG] About to send media with content: account_id='{content["account_id"]}', sender='{content["sender"]}'")
                         try:
-                            file = types.FSInputFile(content["file_path"])
-                            sent_msg = None
-                            if content["file_type"] == "photo":
-                                sent_msg = await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=file)
-                            elif content["file_type"] == "document":
-                                sent_msg = await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=file)
+                            # Handle WhatsApp blob URLs (from new image detection)
+                            if "file_src" in content:
+                                print(f"📥 [TELEGRAM] Downloading WhatsApp image from: {content['file_src'][:100]}...")
+                                
+                                # For now, send just the caption since blob URLs can't be directly downloaded
+                                # In a future enhancement, we could use playwright to screenshot or download the image
+                                caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
+                                sent_msg = await bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=f"{caption_text}\n\n🔗 Imagen desde WhatsApp Web (URL blob no descargable directamente)"
+                                )
+                                print(f"📝 [TELEGRAM] Sent image notification instead of direct image")
+                                
+                            # Handle traditional file paths (from Telegram to WhatsApp media)
+                            elif "file_path" in content:
+                                file = types.FSInputFile(content["file_path"])
+                                sent_msg = None
+                                if content["file_type"] == "photo":
+                                    sent_msg = await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=file)
+                                elif content["file_type"] == "document":
+                                    sent_msg = await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=file)
+                                
+                                # Clean up temporary file
+                                try:
+                                    os.remove(content["file_path"])
+                                    print(f"🗑️ [CLEANUP] Removed temporary file: {content['file_path']}")
+                                except Exception as cleanup_error:
+                                    print(f"⚠️ [CLEANUP] Could not remove file: {cleanup_error}")
+                            else:
+                                print(f"❌ [TELEGRAM] Media content missing both file_src and file_path")
+                                continue
                             
                             if sent_msg:
                                 print(f"🐛 [DEBUG] Media sent successfully, received message_id: {sent_msg.message_id}")
@@ -967,7 +1045,7 @@ async def telegram_bot_main(response_queues):
                                 print(f"✅ [TELEGRAM] Media message sent successfully! Message ID: {sent_msg.message_id}")
                             else:
                                 print(f"🐛 [DEBUG] ❌ sent_msg is None, STATE_MAP NOT SAVED")
-                            os.remove(content["file_path"])
+                                
                         except Exception as telegram_error:
                             print(f"❌ [TELEGRAM] Failed to send media message: {telegram_error}")
                             print(f"🐛 [DEBUG] ❌ STATE_MAP NOT SAVED due to media send failure")
