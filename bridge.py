@@ -29,6 +29,108 @@ message_queue = asyncio.Queue()
 account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
 
+class AdaptiveDelay:
+    """
+    Intelligent adaptive delay system using Fibonacci sequence for progressive backoff.
+    
+    Features:
+    - Starts with 3-second delays for responsiveness
+    - Uses Fibonacci progression: 3, 5, 8, 13, 21, 34, 55, 89, 144, 233...
+    - Caps at maximum 5 minutes (300 seconds)
+    - Resets to minimum delay when messages are found
+    - Tracks state per account for independent delay management
+    """
+    
+    def __init__(self, base_delay=3, max_delay=300, active_delay=0.5):
+        self.base_delay = base_delay  # Base delay in seconds (3s)
+        self.max_delay = max_delay    # Maximum delay in seconds (300s = 5 minutes)
+        self.active_delay = active_delay  # Delay when messages found (0.5s)
+        
+        # Track delay state per account: {account_id: {'consecutive_empty': int, 'current_delay': float}}
+        self.account_states = {}
+    
+    def _get_fibonacci_delay(self, consecutive_empty_checks):
+        """
+        Calculate Fibonacci-based delay with base interval scaling.
+        
+        Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233...
+        Scaled by base_delay: 3, 3, 6, 9, 15, 24, 39, 63, 102, 165, 267...
+        Capped at max_delay: 3, 3, 6, 9, 15, 24, 39, 63, 102, 165, 267, 300, 300...
+        """
+        if consecutive_empty_checks <= 0:
+            return self.base_delay
+        
+        # Generate Fibonacci number for the given position
+        if consecutive_empty_checks == 1:
+            fib = 1
+        elif consecutive_empty_checks == 2:
+            fib = 1
+        else:
+            # Calculate Fibonacci number iteratively
+            a, b = 1, 1
+            for _ in range(3, consecutive_empty_checks + 1):
+                a, b = b, a + b
+            fib = b
+        
+        # Scale by base delay and cap at maximum
+        delay = min(fib * self.base_delay, self.max_delay)
+        return delay
+    
+    def get_delay(self, account_id, found_messages=False):
+        """
+        Get the appropriate delay for an account based on message activity.
+        
+        Args:
+            account_id (str): The account identifier
+            found_messages (bool): True if messages were found in this check
+            
+        Returns:
+            float: Delay in seconds to wait before next check
+        """
+        # Initialize account state if not exists
+        if account_id not in self.account_states:
+            self.account_states[account_id] = {
+                'consecutive_empty': 0,
+                'current_delay': self.base_delay
+            }
+        
+        state = self.account_states[account_id]
+        
+        if found_messages:
+            # Messages found - reset to active delay and clear empty counter
+            state['consecutive_empty'] = 0
+            state['current_delay'] = self.active_delay
+            return self.active_delay
+        else:
+            # No messages found - increment counter and calculate new delay
+            state['consecutive_empty'] += 1
+            new_delay = self._get_fibonacci_delay(state['consecutive_empty'])
+            state['current_delay'] = new_delay
+            return new_delay
+    
+    def get_current_delay(self, account_id):
+        """Get the current delay for an account without updating state."""
+        if account_id not in self.account_states:
+            return self.base_delay
+        return self.account_states[account_id]['current_delay']
+    
+    def get_consecutive_empty_count(self, account_id):
+        """Get the consecutive empty check count for an account."""
+        if account_id not in self.account_states:
+            return 0
+        return self.account_states[account_id]['consecutive_empty']
+    
+    def reset_account(self, account_id):
+        """Reset delay state for a specific account."""
+        if account_id in self.account_states:
+            self.account_states[account_id] = {
+                'consecutive_empty': 0,
+                'current_delay': self.base_delay
+            }
+
+# Initialize adaptive delay system
+adaptive_delay = AdaptiveDelay(base_delay=3, max_delay=300, active_delay=0.5)
+
 async def whatsapp_listener(account_id, user_data_dir, response_queue):
     async with async_playwright() as p:
         # Enhanced browser configuration to bypass WhatsApp Web browser compatibility checks
@@ -311,15 +413,24 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                 
                 print(f"[{account_id}] Found {len(found_unread_chats)} chats with unread messages")
                 
-                # Add delay based on whether unread messages were found
-                if len(found_unread_chats) == 0:
-                    # No unread messages - longer delay to reduce CPU usage
-                    print(f"[{account_id}] No unread messages, waiting 3 seconds before next check...")
-                    await asyncio.sleep(3)
-                else:
-                    # Found unread messages - shorter delay for responsiveness
+                # ADAPTIVE DELAY SYSTEM: Use Fibonacci-based progressive backoff
+                found_unread = len(found_unread_chats) > 0
+                delay_seconds = adaptive_delay.get_delay(account_id, found_unread)
+                consecutive_empty = adaptive_delay.get_consecutive_empty_count(account_id)
+                
+                if found_unread:
                     print(f"[{account_id}] Processing {len(found_unread_chats)} chats with unread messages...")
-                    await asyncio.sleep(0.5)
+                    print(f"[{account_id}] 🚀 ADAPTIVE DELAY: Using active delay of {delay_seconds}s (messages found, reset to responsive mode)")
+                else:
+                    print(f"[{account_id}] No unread messages found (consecutive empty checks: {consecutive_empty})")
+                    if consecutive_empty == 1:
+                        print(f"[{account_id}] ⏳ ADAPTIVE DELAY: First empty check - using {delay_seconds}s delay")
+                    elif delay_seconds >= 300:
+                        print(f"[{account_id}] ⏳ ADAPTIVE DELAY: Maximum backoff reached - using {delay_seconds}s delay (5 minutes)")
+                    else:
+                        print(f"[{account_id}] ⏳ ADAPTIVE DELAY: Progressive backoff - using {delay_seconds}s delay (Fibonacci sequence)")
+                
+                await asyncio.sleep(delay_seconds)
                 
                 for chat_info in found_unread_chats:
                     try:
