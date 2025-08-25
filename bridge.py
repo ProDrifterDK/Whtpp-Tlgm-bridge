@@ -1,5 +1,6 @@
 import asyncio
 import os
+import json
 from playwright.async_api import async_playwright
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ContentType
@@ -24,7 +25,40 @@ ATTACH_BUTTON = "button[data-tab='10'][title='Adjuntar']"
 PHOTO_BUTTON = "button[aria-label*='Fotos y videos'], [data-icon='image']"
 DOCUMENT_BUTTON = "button[aria-label*='Documento'], [data-icon='document']"
 
-state_map = {}
+# Persistent state map with disk storage
+STATE_MAP_FILE = "./state_map.json"
+
+def load_state_map():
+    """Load state_map from disk or create empty one"""
+    try:
+        if os.path.exists(STATE_MAP_FILE):
+            with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
+                loaded_state = json.load(f)
+                # Convert string keys back to integers (JSON saves as strings)
+                state_map = {int(k): v for k, v in loaded_state.items()}
+                print(f"🔄 [STATE] Loaded {len(state_map)} entries from {STATE_MAP_FILE}")
+                print(f"🔄 [STATE] Loaded message IDs: {list(state_map.keys())}")
+                return state_map
+    except Exception as e:
+        print(f"⚠️ [STATE] Error loading state_map: {e}")
+    
+    print("🆕 [STATE] Creating new empty state_map")
+    return {}
+
+def save_state_map(state_map):
+    """Save state_map to disk"""
+    try:
+        # Convert integer keys to strings for JSON compatibility
+        serializable_state = {str(k): v for k, v in state_map.items()}
+        with open(STATE_MAP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable_state, f, indent=2, ensure_ascii=False)
+        print(f"💾 [STATE] Saved {len(state_map)} entries to {STATE_MAP_FILE}")
+    except Exception as e:
+        print(f"❌ [STATE] Error saving state_map: {e}")
+
+# Load persistent state_map
+state_map = load_state_map()
+print(f"🐛 [DEBUG] state_map initialized with {len(state_map)} entries")
 message_queue = asyncio.Queue()
 account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
@@ -729,45 +763,150 @@ async def telegram_bot_main(response_queues):
     
     @dp.message()
     async def handle_text(message: types.Message):
-        if message.reply_to_message and message.reply_to_message.message_id in state_map:
-            state = state_map[message.reply_to_message.message_id]
-            response_msg = {
-                "chat_target": state["chat_original"],
-                "text": message.text,
-                "type": "text"
-            }
-            await response_queues[state["account"]].put(response_msg)
+        print(f"🐛 [DEBUG] handle_text called - message_id: {message.message_id}")
+        print(f"🐛 [DEBUG] Reply to message: {message.reply_to_message is not None}")
+        
+        if message.reply_to_message:
+            reply_to_id = message.reply_to_message.message_id
+            print(f"🐛 [DEBUG] Looking up state_map for reply_to_message_id: {reply_to_id}")
+            print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
+            print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
+            print(f"🐛 [DEBUG] Key exists in state_map: {reply_to_id in state_map}")
+            
+            if reply_to_id in state_map:
+                state = state_map[reply_to_id]
+                print(f"🐛 [DEBUG] ✅ STATE_MAP LOOKUP SUCCESS - Found: {state}")
+                response_msg = {
+                    "chat_target": state["chat_original"],
+                    "text": message.text,
+                    "type": "text"
+                }
+                print(f"🐛 [DEBUG] Sending response to queue: {response_msg}")
+                await response_queues[state["account"]].put(response_msg)
+                
+                # Success feedback
+                await message.reply(f"✅ Respuesta enviada a {state['chat_original']} vía {state['account']}")
+            else:
+                print(f"🐛 [DEBUG] ❌ STATE_MAP LOOKUP FAILED - Key {reply_to_id} not found")
+                
+                # Detailed error message
+                if len(state_map) == 0:
+                    error_msg = (
+                        "❌ No se puede enviar la respuesta.\n\n"
+                        "🔄 **Causa**: El bot se reinició y perdió la información de mensajes anteriores.\n\n"
+                        "💡 **Solución**: \n"
+                        "• Espera a que llegue un nuevo mensaje de WhatsApp\n"
+                        "• Luego responde a ese mensaje nuevo"
+                    )
+                else:
+                    available_ids = list(state_map.keys())
+                    error_msg = (
+                        f"❌ No se puede enviar la respuesta.\n\n"
+                        f"🔍 **Mensaje ID {reply_to_id}** no encontrado en el sistema.\n\n"
+                        f"📋 **IDs disponibles**: {available_ids}\n\n"
+                        f"💡 **Solución**: Responde solo a mensajes recientes de WhatsApp"
+                    )
+                
+                await message.reply(error_msg, parse_mode="Markdown")
         else:
-            await message.reply("Por favor responde a un mensaje para enviar la respuesta.")
+            print(f"🐛 [DEBUG] ❌ No reply_to_message found")
+            
+            error_msg = (
+                "❌ Comando no válido.\n\n"
+                "📝 **Para enviar un mensaje a WhatsApp**:\n"
+                "1️⃣ Espera que llegue un mensaje de WhatsApp\n"
+                "2️⃣ Haz clic en 'Responder' a ese mensaje\n"
+                "3️⃣ Escribe tu respuesta\n\n"
+                "ℹ️ No puedes enviar mensajes directos, solo responder."
+            )
+            
+            await message.reply(error_msg, parse_mode="Markdown")
     
     @dp.message((F.photo) | (F.document))
     async def handle_media(message: types.Message):
-        if message.reply_to_message and message.reply_to_message.message_id in state_map:
-            state = state_map[message.reply_to_message.message_id]
+        print(f"🐛 [DEBUG] handle_media called - message_id: {message.message_id}")
+        print(f"🐛 [DEBUG] Reply to message: {message.reply_to_message is not None}")
+        
+        if message.reply_to_message:
+            reply_to_id = message.reply_to_message.message_id
+            print(f"🐛 [DEBUG] Looking up state_map for reply_to_message_id (media): {reply_to_id}")
+            print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
+            print(f"🐛 [DEBUG] Key exists in state_map: {reply_to_id in state_map}")
             
-            if message.photo:
-                file_id = message.photo[-1].file_id
-                file_type = "photo"
-            elif message.document:
-                file_id = message.document.file_id
-                file_type = "document"
-            else:
-                return
-            
-            file = await bot.get_file(file_id)
-            if not file.file_path:
-                return  # Skip if no file path
+            if reply_to_id in state_map:
+                state = state_map[reply_to_id]
+                print(f"🐛 [DEBUG] ✅ STATE_MAP LOOKUP SUCCESS (media) - Found: {state}")
+                
+                if message.photo:
+                    file_id = message.photo[-1].file_id
+                    file_type = "photo"
+                    media_type = "📸 Foto"
+                elif message.document:
+                    file_id = message.document.file_id
+                    file_type = "document"
+                    media_type = "📁 Documento"
+                else:
+                    await message.reply("❌ Tipo de archivo no soportado.")
+                    return
+                
+                try:
+                    file = await bot.get_file(file_id)
+                    if not file.file_path:
+                        await message.reply("❌ Error: No se pudo obtener el archivo.")
+                        return
 
-            file_name = file.file_path.split('/')[-1]
-            file_path = f"./downloads/{file_name}"
-            await bot.download_file(file.file_path, destination=file_path)
+                    file_name = file.file_path.split('/')[-1]
+                    file_path = f"./downloads/{file_name}"
+                    await bot.download_file(file.file_path, destination=file_path)
+                    
+                    print(f"🐛 [DEBUG] Sending media response to queue: account={state['account']}, chat_target={state['chat_original']}")
+                    await response_queues[state["account"]].put({
+                        "type": "media",
+                        "file_path": file_path,
+                        "file_type": file_type,
+                        "chat_target": state["chat_original"]
+                    })
+                    
+                    # Success feedback
+                    await message.reply(f"✅ {media_type} enviado a {state['chat_original']} vía {state['account']}")
+                    
+                except Exception as e:
+                    await message.reply(f"❌ Error procesando archivo: {str(e)}")
+            else:
+                print(f"🐛 [DEBUG] ❌ STATE_MAP LOOKUP FAILED (media) - Key {reply_to_id} not found")
+                
+                # Same detailed error as text handler
+                if len(state_map) == 0:
+                    error_msg = (
+                        "❌ No se puede enviar el archivo.\n\n"
+                        "🔄 **Causa**: El bot se reinició y perdió la información de mensajes anteriores.\n\n"
+                        "💡 **Solución**: \n"
+                        "• Espera a que llegue un nuevo mensaje de WhatsApp\n"
+                        "• Luego responde con tu archivo a ese mensaje nuevo"
+                    )
+                else:
+                    available_ids = list(state_map.keys())
+                    error_msg = (
+                        f"❌ No se puede enviar el archivo.\n\n"
+                        f"🔍 **Mensaje ID {reply_to_id}** no encontrado en el sistema.\n\n"
+                        f"📋 **IDs disponibles**: {available_ids}\n\n"
+                        f"💡 **Solución**: Responde solo a mensajes recientes de WhatsApp"
+                    )
+                
+                await message.reply(error_msg, parse_mode="Markdown")
+        else:
+            print(f"🐛 [DEBUG] ❌ No reply_to_message found (media)")
             
-            await response_queues[state["account"]].put({
-                "type": "media",
-                "file_path": file_path,
-                "file_type": file_type,
-                "chat_target": state["chat_original"]
-            })
+            error_msg = (
+                "❌ Comando no válido para archivos.\n\n"
+                "📎 **Para enviar archivos a WhatsApp**:\n"
+                "1️⃣ Espera que llegue un mensaje de WhatsApp\n"
+                "2️⃣ Haz clic en 'Responder' a ese mensaje\n"
+                "3️⃣ Adjunta tu foto/documento como respuesta\n\n"
+                "ℹ️ No puedes enviar archivos directos, solo como respuesta."
+            )
+            
+            await message.reply(error_msg, parse_mode="Markdown")
     
     async def queue_consumer():
         print("🚀 [QUEUE CONSUMER] Starting queue consumer...")
@@ -780,18 +919,29 @@ async def telegram_bot_main(response_queues):
                 if source == 'whatsapp':
                     if content["type"] == "text":
                         print(f"📤 [TELEGRAM] Sending text message to Telegram...")
+                        print(f"🐛 [DEBUG] About to send message with content: account_id='{content["account_id"]}', sender='{content["sender"]}'")
                         try:
                             sent_msg = await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
-                            state_map[sent_msg.message_id] = {
+                            print(f"🐛 [DEBUG] Message sent successfully, received message_id: {sent_msg.message_id}")
+                            
+                            # Save to state_map
+                            state_entry = {
                                 'account': content["account_id"],
                                 'chat_original': content["sender"]
                             }
+                            state_map[sent_msg.message_id] = state_entry
+                            
+                            print(f"🐛 [DEBUG] ✅ STATE_MAP SAVED - Key: {sent_msg.message_id}, Value: {state_entry}")
+                            print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
+                            print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
                             print(f"✅ [TELEGRAM] Text message sent successfully! Message ID: {sent_msg.message_id}")
                         except Exception as telegram_error:
                             print(f"❌ [TELEGRAM] Failed to send text message: {telegram_error}")
+                            print(f"🐛 [DEBUG] ❌ STATE_MAP NOT SAVED due to send failure")
                             
                     elif content["type"] == "media":
                         print(f"📤 [TELEGRAM] Sending media message to Telegram...")
+                        print(f"🐛 [DEBUG] About to send media with content: account_id='{content["account_id"]}', sender='{content["sender"]}'")
                         try:
                             file = types.FSInputFile(content["file_path"])
                             sent_msg = None
@@ -801,14 +951,26 @@ async def telegram_bot_main(response_queues):
                                 sent_msg = await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=file)
                             
                             if sent_msg:
-                                state_map[sent_msg.message_id] = {
+                                print(f"🐛 [DEBUG] Media sent successfully, received message_id: {sent_msg.message_id}")
+                                
+                                # Save to state_map
+                                state_entry = {
                                     'account': content["account_id"],
                                     'chat_original': content["sender"]
                                 }
+                                state_map[sent_msg.message_id] = state_entry
+                                save_state_map(state_map)  # Persist to disk
+                                
+                                print(f"🐛 [DEBUG] ✅ STATE_MAP SAVED - Key: {sent_msg.message_id}, Value: {state_entry}")
+                                print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
+                                print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
                                 print(f"✅ [TELEGRAM] Media message sent successfully! Message ID: {sent_msg.message_id}")
+                            else:
+                                print(f"🐛 [DEBUG] ❌ sent_msg is None, STATE_MAP NOT SAVED")
                             os.remove(content["file_path"])
                         except Exception as telegram_error:
                             print(f"❌ [TELEGRAM] Failed to send media message: {telegram_error}")
+                            print(f"🐛 [DEBUG] ❌ STATE_MAP NOT SAVED due to media send failure")
                             
                     elif content["type"] == "status":
                         print(f"📤 [TELEGRAM] Sending status message to Telegram...")
