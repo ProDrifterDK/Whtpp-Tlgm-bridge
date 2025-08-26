@@ -31,16 +31,24 @@ STATE_MAP_FILE = "./state_map.json"
 def load_state_map():
     """Load state_map from disk or create empty one"""
     try:
+        print(f"🐛 [STATE DEBUG] Checking if {STATE_MAP_FILE} exists...")
         if os.path.exists(STATE_MAP_FILE):
+            print(f"🐛 [STATE DEBUG] File exists, attempting to load...")
             with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
                 loaded_state = json.load(f)
+                print(f"🐛 [STATE DEBUG] Raw loaded data keys: {list(loaded_state.keys())}")
+                
                 # Convert string keys back to integers (JSON saves as strings)
                 state_map = {int(k): v for k, v in loaded_state.items()}
                 print(f"🔄 [STATE] Loaded {len(state_map)} entries from {STATE_MAP_FILE}")
                 print(f"🔄 [STATE] Loaded message IDs: {list(state_map.keys())}")
                 return state_map
+        else:
+            print(f"🐛 [STATE DEBUG] File {STATE_MAP_FILE} does not exist")
     except Exception as e:
         print(f"⚠️ [STATE] Error loading state_map: {e}")
+        import traceback
+        print(f"⚠️ [STATE] Traceback: {traceback.format_exc()}")
     
     print("🆕 [STATE] Creating new empty state_map")
     return {}
@@ -48,13 +56,36 @@ def load_state_map():
 def save_state_map(state_map):
     """Save state_map to disk"""
     try:
+        print(f"🐛 [STATE DEBUG] About to save state_map with {len(state_map)} entries")
+        print(f"🐛 [STATE DEBUG] Keys to save: {list(state_map.keys())}")
+        
         # Convert integer keys to strings for JSON compatibility
         serializable_state = {str(k): v for k, v in state_map.items()}
+        
         with open(STATE_MAP_FILE, 'w', encoding='utf-8') as f:
             json.dump(serializable_state, f, indent=2, ensure_ascii=False)
+            f.flush()  # Force write to disk
+            os.fsync(f.fileno())  # Force OS to write to disk
+        
         print(f"💾 [STATE] Saved {len(state_map)} entries to {STATE_MAP_FILE}")
+        
+        # DIAGNOSTIC: Verify file was actually written
+        try:
+            if os.path.exists(STATE_MAP_FILE):
+                with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
+                    verification_data = json.load(f)
+                    verification_keys = list(verification_data.keys())
+                    print(f"🔍 [STATE VERIFY] File exists with {len(verification_data)} entries")
+                    print(f"🔍 [STATE VERIFY] Keys in file: {verification_keys}")
+            else:
+                print(f"❌ [STATE VERIFY] File does not exist after save!")
+        except Exception as verify_error:
+            print(f"❌ [STATE VERIFY] Error verifying save: {verify_error}")
+            
     except Exception as e:
         print(f"❌ [STATE] Error saving state_map: {e}")
+        import traceback
+        print(f"❌ [STATE] Traceback: {traceback.format_exc()}")
 
 # Load persistent state_map
 state_map = load_state_map()
@@ -362,21 +393,247 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
             try:
                 response_msg = response_queue.get_nowait()
                 if response_msg["type"] == "text":
-                    await page.locator(SEARCH_BOX).fill(response_msg["chat_target"])
-                    await page.locator(CHAT_RESULT).first.click()
-                    await page.locator(MESSAGE_INPUT).fill(response_msg["text"])
-                    await page.locator(SEND_BUTTON).click()
+                    print(f"📝 [{account_id}] SENDING TEXT: Starting text message send process...")
+                    
+                    try:
+                        # Step 0: CRITICAL - Navigate back to chat list first
+                        print(f"🏠 [{account_id}] NAVIGATION: Ensuring we're in chat list view...")
+                        current_url = page.url
+                        print(f"  📍 Current URL: {current_url}")
+                        
+                        # If we're in a specific chat, go back to main chat list
+                        if "/chat/" in current_url or current_url.count('/') > 3:
+                            print(f"  🔙 Currently in individual chat, navigating to main chat list...")
+                            # Try multiple ways to get back to main chat list
+                            try:
+                                # Method 1: Try pressing Escape key
+                                await page.keyboard.press('Escape')
+                                await asyncio.sleep(1)
+                                print(f"  ⌨️ Pressed Escape key")
+                            except:
+                                pass
+                                
+                            try:
+                                # Method 2: Try to click WhatsApp logo/home
+                                logo_element = await page.query_selector('img[alt="WhatsApp"]')
+                                if logo_element:
+                                    await logo_element.click()
+                                    await asyncio.sleep(1)
+                                    print(f"  🏠 Clicked WhatsApp logo")
+                            except:
+                                pass
+                                
+                            try:
+                                # Method 3: Navigate to base WhatsApp URL
+                                await page.goto('https://web.whatsapp.com/', wait_until='networkidle')
+                                await asyncio.sleep(2)
+                                print(f"  🌐 Navigated to base WhatsApp URL")
+                            except:
+                                pass
+                        
+                        # Verify we're in the main chat list
+                        chat_list_element = await page.wait_for_selector("div[aria-label='Lista de chats']", timeout=10000)
+                        if not chat_list_element:
+                            raise Exception("Could not find chat list after navigation")
+                        print(f"  ✅ Successfully in main chat list view")
+                        
+                        # Step 1: Enhanced search with diagnostic
+                        print(f"🔍 [{account_id}] SEARCH STEP: Filling search box with '{response_msg['chat_target']}'")
+                        search_element = await page.wait_for_selector(SEARCH_BOX, timeout=10000)
+                        if not search_element:
+                            raise Exception("Could not find search box")
+                        
+                        await search_element.click()
+                        await search_element.fill(response_msg["chat_target"])
+                        print(f"  ✅ Search box filled with: '{response_msg['chat_target']}'")
+                        
+                        # Step 2: Wait for search results and click chat
+                        print(f"👆 [{account_id}] CLICK STEP: Looking for chat result...")
+                        await asyncio.sleep(2)  # Increased wait time for search results
+                        
+                        # Look for chat results
+                        chat_elements = await page.query_selector_all(CHAT_RESULT)
+                        print(f"  📊 Found {len(chat_elements)} potential chats")
+                        
+                        target_found = False
+                        target_name_clean = response_msg["chat_target"].replace('✨', '').replace('❤️', '').strip()
+                        
+                        for i, chat_element in enumerate(chat_elements):
+                            try:
+                                chat_text = await chat_element.inner_text()
+                                chat_text_clean = chat_text.replace('✨', '').replace('❤️', '').strip()
+                                print(f"    📝 Chat {i+1} text: '{chat_text[:30]}...'")
+                                
+                                if target_name_clean.lower() in chat_text_clean.lower():
+                                    print(f"  ✅ MATCH FOUND: Chat {i+1} matches target '{response_msg['chat_target']}'")
+                                    await chat_element.click()
+                                    target_found = True
+                                    break
+                                else:
+                                    print(f"    ❌ No match: '{target_name_clean}' not found in '{chat_text_clean[:30]}...'")
+                            except Exception as chat_error:
+                                print(f"    ⚠️ Error analyzing chat {i+1}: {chat_error}")
+                                continue
+                        
+                        if not target_found:
+                            raise Exception(f"Could not find chat '{response_msg['chat_target']}' in {len(chat_elements)} search results")
+                        
+                        # Step 3: Wait for navigation
+                        print(f"⏳ [{account_id}] NAVIGATION: Waiting for chat to load...")
+                        await asyncio.sleep(2)  # Wait for chat to load
+                        
+                        # Step 4: Enhanced message input
+                        print(f"✏️ [{account_id}] MESSAGE STEP: Typing message '{response_msg['text'][:50]}...'")
+                        message_element = await page.wait_for_selector(MESSAGE_INPUT, timeout=10000)
+                        if not message_element:
+                            raise Exception("Could not find message input")
+                            
+                        await message_element.click()
+                        await message_element.fill(response_msg["text"])
+                        print(f"  ✅ Message typed successfully")
+                        
+                        # Step 5: Enhanced send
+                        print(f"🚀 [{account_id}] SEND STEP: Clicking send button...")
+                        send_element = await page.wait_for_selector(SEND_BUTTON, timeout=5000)
+                        if not send_element:
+                            raise Exception("Could not find send button")
+                            
+                        await send_element.click()
+                        print(f"  ✅ Send button clicked successfully")
+                        
+                        print(f"✅ [{account_id}] TEXT MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
+                        
+                    except Exception as send_error:
+                        print(f"❌ [{account_id}] SEND ERROR: {send_error}")
+                        raise send_error
                 elif response_msg["type"] == "media":
-                    await page.locator(SEARCH_BOX).fill(response_msg["chat_target"])
-                    await page.locator(CHAT_RESULT).first.click()
-                    async with page.expect_file_chooser() as fc_info:
-                        await page.locator(ATTACH_BUTTON).click()
-                        await page.locator(DOCUMENT_BUTTON if response_msg["file_type"] == "document" else PHOTO_BUTTON).click()
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(response_msg["file_path"])
-                    await asyncio.sleep(0.5)
-                    await page.locator(SEND_BUTTON).click()
-                    os.remove(response_msg["file_path"])
+                    print(f"📎 [{account_id}] SENDING MEDIA: Starting media message send process...")
+                    
+                    try:
+                        # Step 0: CRITICAL - Navigate back to chat list first (same as text)
+                        print(f"🏠 [{account_id}] NAVIGATION: Ensuring we're in chat list view...")
+                        current_url = page.url
+                        print(f"  📍 Current URL: {current_url}")
+                        
+                        # If we're in a specific chat, go back to main chat list
+                        if "/chat/" in current_url or current_url.count('/') > 3:
+                            print(f"  🔙 Currently in individual chat, navigating to main chat list...")
+                            # Try multiple ways to get back to main chat list
+                            try:
+                                await page.keyboard.press('Escape')
+                                await asyncio.sleep(1)
+                                print(f"  ⌨️ Pressed Escape key")
+                            except:
+                                pass
+                                
+                            try:
+                                logo_element = await page.query_selector('img[alt="WhatsApp"]')
+                                if logo_element:
+                                    await logo_element.click()
+                                    await asyncio.sleep(1)
+                                    print(f"  🏠 Clicked WhatsApp logo")
+                            except:
+                                pass
+                                
+                            try:
+                                await page.goto('https://web.whatsapp.com/', wait_until='networkidle')
+                                await asyncio.sleep(2)
+                                print(f"  🌐 Navigated to base WhatsApp URL")
+                            except:
+                                pass
+                        
+                        # Verify we're in the main chat list
+                        chat_list_element = await page.wait_for_selector("div[aria-label='Lista de chats']", timeout=10000)
+                        if not chat_list_element:
+                            raise Exception("Could not find chat list after navigation")
+                        print(f"  ✅ Successfully in main chat list view")
+                        
+                        # Step 1: Enhanced search with diagnostic
+                        print(f"🔍 [{account_id}] SEARCH STEP: Filling search box with '{response_msg['chat_target']}'")
+                        search_element = await page.wait_for_selector(SEARCH_BOX, timeout=10000)
+                        if not search_element:
+                            raise Exception("Could not find search box")
+                        
+                        await search_element.click()
+                        await search_element.fill(response_msg["chat_target"])
+                        print(f"  ✅ Search box filled with: '{response_msg['chat_target']}'")
+                        
+                        # Step 2: Wait for search results and click chat
+                        print(f"👆 [{account_id}] CLICK STEP: Looking for chat result...")
+                        await asyncio.sleep(2)  # Increased wait time for search results
+                        
+                        chat_elements = await page.query_selector_all(CHAT_RESULT)
+                        print(f"  📊 Found {len(chat_elements)} potential chats")
+                        
+                        target_found = False
+                        target_name_clean = response_msg["chat_target"].replace('✨', '').replace('❤️', '').strip()
+                        
+                        for i, chat_element in enumerate(chat_elements):
+                            try:
+                                chat_text = await chat_element.inner_text()
+                                chat_text_clean = chat_text.replace('✨', '').replace('❤️', '').strip()
+                                print(f"    📝 Chat {i+1} text: '{chat_text[:30]}...'")
+                                
+                                if target_name_clean.lower() in chat_text_clean.lower():
+                                    print(f"  ✅ MATCH FOUND: Chat {i+1} matches target '{response_msg['chat_target']}'")
+                                    await chat_element.click()
+                                    target_found = True
+                                    break
+                            except Exception as chat_error:
+                                print(f"    ⚠️ Error analyzing chat {i+1}: {chat_error}")
+                                continue
+                        
+                        if not target_found:
+                            raise Exception(f"Could not find chat '{response_msg['chat_target']}' in {len(chat_elements)} search results")
+                        
+                        # Step 3: Wait for navigation
+                        print(f"⏳ [{account_id}] NAVIGATION: Waiting for chat to load...")
+                        await asyncio.sleep(2)  # Wait for chat to load
+                        
+                        # Step 4: Enhanced media attachment
+                        print(f"📎 [{account_id}] ATTACH STEP: Attaching media file...")
+                        async with page.expect_file_chooser() as fc_info:
+                            attach_element = await page.wait_for_selector(ATTACH_BUTTON, timeout=10000)
+                            if not attach_element:
+                                raise Exception("Could not find attach button")
+                            await attach_element.click()
+                            print(f"  ✅ Attach button clicked")
+                            
+                            # Select appropriate button
+                            media_button = DOCUMENT_BUTTON if response_msg["file_type"] == "document" else PHOTO_BUTTON
+                            media_element = await page.wait_for_selector(media_button, timeout=5000)
+                            if not media_element:
+                                raise Exception(f"Could not find {response_msg['file_type']} button")
+                            await media_element.click()
+                            print(f"  ✅ {response_msg['file_type']} button clicked")
+                            
+                        file_chooser = await fc_info.value
+                        await file_chooser.set_files(response_msg["file_path"])
+                        print(f"  ✅ File selected: {response_msg['file_path']}")
+                        
+                        await asyncio.sleep(0.5)
+                        
+                        # Step 5: Enhanced send
+                        print(f"🚀 [{account_id}] SEND STEP: Clicking send button...")
+                        send_element = await page.wait_for_selector(SEND_BUTTON, timeout=5000)
+                        if not send_element:
+                            raise Exception("Could not find send button")
+                            
+                        await send_element.click()
+                        print(f"  ✅ Send button clicked successfully")
+                        
+                        # Clean up file
+                        try:
+                            os.remove(response_msg["file_path"])
+                            print(f"  🗑️ Temporary file removed: {response_msg['file_path']}")
+                        except Exception as cleanup_error:
+                            print(f"  ⚠️ Could not remove file: {cleanup_error}")
+                        
+                        print(f"✅ [{account_id}] MEDIA MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
+                        
+                    except Exception as send_error:
+                        print(f"❌ [{account_id}] MEDIA SEND ERROR: {send_error}")
+                        raise send_error
             except asyncio.QueueEmpty:
                 pass
             except Exception as e:
