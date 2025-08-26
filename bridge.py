@@ -996,18 +996,61 @@ async def telegram_bot_main(response_queues):
                         print(f"📤 [TELEGRAM] Sending media message to Telegram...")
                         print(f"🐛 [DEBUG] About to send media with content: account_id='{content["account_id"]}', sender='{content["sender"]}'")
                         try:
-                            # Handle WhatsApp blob URLs (from new image detection)
+                            # Handle WhatsApp blob URLs and data URIs (from new image detection)
                             if "file_src" in content:
-                                print(f"📥 [TELEGRAM] Downloading WhatsApp image from: {content['file_src'][:100]}...")
+                                file_src = content['file_src']
+                                print(f"📥 [TELEGRAM] Processing WhatsApp image from: {file_src[:100]}...")
                                 
-                                # For now, send just the caption since blob URLs can't be directly downloaded
-                                # In a future enhancement, we could use playwright to screenshot or download the image
-                                caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
-                                sent_msg = await bot.send_message(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    text=f"{caption_text}\n\n🔗 Imagen desde WhatsApp Web (URL blob no descargable directamente)"
-                                )
-                                print(f"📝 [TELEGRAM] Sent image notification instead of direct image")
+                                # Handle data URI images (can be sent directly)
+                                if file_src.startswith('data:image/'):
+                                    print(f"🖼️ [TELEGRAM] Processing data URI image...")
+                                    try:
+                                        import base64
+                                        import io
+                                        
+                                        # Extract base64 data from data URI
+                                        header, data = file_src.split(',', 1)
+                                        image_data = base64.b64decode(data)
+                                        
+                                        # Create file-like object
+                                        image_file = io.BytesIO(image_data)
+                                        image_file.name = "whatsapp_image.jpg"
+                                        
+                                        # Send actual image to Telegram
+                                        caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
+                                        sent_msg = await bot.send_photo(
+                                            chat_id=TELEGRAM_CHAT_ID,
+                                            photo=types.BufferedInputFile(image_data, filename="whatsapp_image.jpg"),
+                                            caption=caption_text
+                                        )
+                                        print(f"📸 [TELEGRAM] Successfully sent data URI image!")
+                                        
+                                    except Exception as data_uri_error:
+                                        print(f"❌ [TELEGRAM] Failed to process data URI: {data_uri_error}")
+                                        # Fallback to text notification
+                                        caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
+                                        sent_msg = await bot.send_message(
+                                            chat_id=TELEGRAM_CHAT_ID,
+                                            text=f"{caption_text}\n\n⚠️ Error procesando imagen data URI"
+                                        )
+                                
+                                # Handle blob URLs (send notification for now)
+                                elif file_src.startswith('blob:'):
+                                    print(f"🔗 [TELEGRAM] Blob URL detected - sending notification...")
+                                    caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
+                                    sent_msg = await bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=f"{caption_text}\n\n🔗 Imagen desde WhatsApp Web (URL blob no descargable directamente)"
+                                    )
+                                    print(f"📝 [TELEGRAM] Sent blob URL notification")
+                                
+                                else:
+                                    print(f"❌ [TELEGRAM] Unknown image source format: {file_src[:50]}...")
+                                    caption_text = content.get("caption", f"[{content['account_id']}] 📸 Imagen de {content['sender']}")
+                                    sent_msg = await bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=f"{caption_text}\n\n❓ Formato de imagen desconocido"
+                                    )
                                 
                             # Handle traditional file paths (from Telegram to WhatsApp media)
                             elif "file_path" in content:
