@@ -1,6 +1,8 @@
 import asyncio
 import os
 import json
+import signal
+from asyncio import Lock
 from playwright.async_api import async_playwright
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ContentType
@@ -27,72 +29,464 @@ DOCUMENT_BUTTON = "button[aria-label*='Documento'], [data-icon='document']"
 
 # Persistent state map with disk storage
 STATE_MAP_FILE = "./state_map.json"
+STATE_MAP_BACKUP_DIR = "./state_backups"
+MAX_BACKUP_FILES = 10  # Keep maximum 10 backup files
 
 def load_state_map():
-    """Load state_map from disk or create empty one"""
+    """Load state_map from disk or create empty one with enhanced error handling"""
     try:
         print(f"🐛 [STATE DEBUG] Checking if {STATE_MAP_FILE} exists...")
         if os.path.exists(STATE_MAP_FILE):
             print(f"🐛 [STATE DEBUG] File exists, attempting to load...")
-            with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
-                loaded_state = json.load(f)
-                print(f"🐛 [STATE DEBUG] Raw loaded data keys: {list(loaded_state.keys())}")
-                
-                # Convert string keys back to integers (JSON saves as strings)
-                state_map = {int(k): v for k, v in loaded_state.items()}
-                print(f"🔄 [STATE] Loaded {len(state_map)} entries from {STATE_MAP_FILE}")
-                print(f"🔄 [STATE] Loaded message IDs: {list(state_map.keys())}")
-                return state_map
+
+            # Check file size to detect potentially empty/corrupted files
+            file_size = os.path.getsize(STATE_MAP_FILE)
+            if file_size == 0:
+                print(f"⚠️ [STATE] File {STATE_MAP_FILE} is empty, creating new state_map")
+                return {}
+
+            try:
+                with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
+                    loaded_state = json.load(f)
+                    print(f"🐛 [STATE DEBUG] Raw loaded data keys: {list(loaded_state.keys())}")
+
+                    # Validate loaded data structure
+                    if not isinstance(loaded_state, dict):
+                        raise ValueError(f"Expected dict, got {type(loaded_state)}")
+
+                    # Convert string keys back to integers (JSON saves as strings)
+                    state_map = {}
+                    for k, v in loaded_state.items():
+                        try:
+                            int_key = int(k)
+                            state_map[int_key] = v
+                        except (ValueError, TypeError) as key_error:
+                            print(f"⚠️ [STATE] Skipping invalid key '{k}': {key_error}")
+                            continue
+
+                    print(f"🔄 [STATE] Loaded {len(state_map)} entries from {STATE_MAP_FILE}")
+                    print(f"🔄 [STATE] Loaded message IDs: {list(state_map.keys())}")
+                    return state_map
+
+            except json.JSONDecodeError as json_error:
+                print(f"❌ [STATE] JSON decode error in {STATE_MAP_FILE}: {json_error}")
+                print(f"📁 [STATE] File size: {file_size} bytes")
+                # Try to read first few lines for debugging
+                try:
+                    with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
+                        first_lines = ''.join(f.readline() for _ in range(3))
+                        print(f"📄 [STATE] First lines of file: {repr(first_lines)}")
+                except:
+                    pass
+                return {}
+
+            except (UnicodeDecodeError, IOError) as file_error:
+                print(f"❌ [STATE] File read error: {file_error}")
+                return {}
+
+            except (ValueError, TypeError) as data_error:
+                print(f"❌ [STATE] Data validation error: {data_error}")
+                return {}
         else:
             print(f"🐛 [STATE DEBUG] File {STATE_MAP_FILE} does not exist")
+
     except Exception as e:
-        print(f"⚠️ [STATE] Error loading state_map: {e}")
+        print(f"⚠️ [STATE] Unexpected error loading state_map: {e}")
         import traceback
         print(f"⚠️ [STATE] Traceback: {traceback.format_exc()}")
-    
+
     print("🆕 [STATE] Creating new empty state_map")
     return {}
 
-def save_state_map(state_map):
-    """Save state_map to disk"""
+def save_state_map_sync(state_map):
+    """Save state_map to disk with enhanced error handling (synchronous version)"""
     try:
         print(f"🐛 [STATE DEBUG] About to save state_map with {len(state_map)} entries")
         print(f"🐛 [STATE DEBUG] Keys to save: {list(state_map.keys())}")
-        
+
+        # Validate input data
+        if not isinstance(state_map, dict):
+            raise ValueError(f"Expected dict, got {type(state_map)}")
+
         # Convert integer keys to strings for JSON compatibility
-        serializable_state = {str(k): v for k, v in state_map.items()}
-        
-        with open(STATE_MAP_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable_state, f, indent=2, ensure_ascii=False)
-            f.flush()  # Force write to disk
-            os.fsync(f.fileno())  # Force OS to write to disk
-        
-        print(f"💾 [STATE] Saved {len(state_map)} entries to {STATE_MAP_FILE}")
-        
+        try:
+            serializable_state = {str(k): v for k, v in state_map.items()}
+        except (ValueError, TypeError) as conversion_error:
+            print(f"❌ [STATE] Error converting keys to strings: {conversion_error}")
+            return False
+
+        # Create backup of existing file if it exists
+        backup_created = False
+        backup_file = f"{STATE_MAP_FILE}.backup"
+        if os.path.exists(STATE_MAP_FILE):
+            try:
+                import shutil
+                shutil.copy2(STATE_MAP_FILE, backup_file)
+                backup_created = True
+                print(f"📁 [STATE] Created backup: {backup_file}")
+            except Exception as backup_error:
+                print(f"⚠️ [STATE] Failed to create backup: {backup_error}")
+
+        # Write to temporary file first for atomic operation
+        temp_file = f"{STATE_MAP_FILE}.tmp"
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(serializable_state, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Force OS to write to disk
+
+            # Atomic move to final location
+            import shutil
+            shutil.move(temp_file, STATE_MAP_FILE)
+            print(f"💾 [STATE] Saved {len(state_map)} entries to {STATE_MAP_FILE}")
+
+        except (OSError, IOError) as file_error:
+            print(f"❌ [STATE] File system error during save: {file_error}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            return False
+
         # DIAGNOSTIC: Verify file was actually written
         try:
             if os.path.exists(STATE_MAP_FILE):
+                file_size = os.path.getsize(STATE_MAP_FILE)
+                if file_size == 0:
+                    raise ValueError("File is empty after save")
+
                 with open(STATE_MAP_FILE, 'r', encoding='utf-8') as f:
                     verification_data = json.load(f)
                     verification_keys = list(verification_data.keys())
-                    print(f"🔍 [STATE VERIFY] File exists with {len(verification_data)} entries")
+                    print(f"🔍 [STATE VERIFY] File exists with {len(verification_data)} entries ({file_size} bytes)")
                     print(f"🔍 [STATE VERIFY] Keys in file: {verification_keys}")
+
+                    # Verify data integrity
+                    if len(verification_data) != len(state_map):
+                        raise ValueError(f"Data count mismatch: expected {len(state_map)}, got {len(verification_data)}")
             else:
-                print(f"❌ [STATE VERIFY] File does not exist after save!")
+                raise FileNotFoundError("File does not exist after save")
         except Exception as verify_error:
             print(f"❌ [STATE VERIFY] Error verifying save: {verify_error}")
-            
+            # Try to restore from backup if verification fails
+            if backup_created and os.path.exists(backup_file):
+                try:
+                    shutil.move(backup_file, STATE_MAP_FILE)
+                    print(f"🔄 [STATE] Restored from backup due to verification failure")
+                except Exception as restore_error:
+                    print(f"❌ [STATE] Failed to restore from backup: {restore_error}")
+            return False
+
+        # Clean up backup file if everything succeeded
+        if backup_created and os.path.exists(backup_file):
+            try:
+                os.remove(backup_file)
+                print(f"🗑️ [STATE] Cleaned up backup file")
+            except Exception as cleanup_error:
+                print(f"⚠️ [STATE] Failed to clean up backup: {cleanup_error}")
+
+        return True
+
+    except (ValueError, TypeError) as data_error:
+        print(f"❌ [STATE] Data validation error: {data_error}")
+        return False
     except Exception as e:
-        print(f"❌ [STATE] Error saving state_map: {e}")
+        print(f"❌ [STATE] Unexpected error saving state_map: {e}")
         import traceback
         print(f"❌ [STATE] Traceback: {traceback.format_exc()}")
+        return False
+
+async def save_state_map(state_map):
+    """Async wrapper for thread-safe state_map saving"""
+    async with state_map_lock:
+        return save_state_map_sync(state_map)
 
 # Load persistent state_map
 state_map = load_state_map()
 print(f"🐛 [DEBUG] state_map initialized with {len(state_map)} entries")
+
+# Thread-safe lock for state_map operations
+state_map_lock = Lock()
+
+async def get_state_map_entry(key):
+    """Thread-safe getter for state_map entries"""
+    async with state_map_lock:
+        return state_map.get(key)
+
+async def set_state_map_entry(key, value):
+    """Thread-safe setter for state_map entries"""
+    async with state_map_lock:
+        state_map[key] = value
+
+async def check_state_map_key(key):
+    """Thread-safe check for key existence in state_map"""
+    async with state_map_lock:
+        return key in state_map
+
+def create_timestamped_backup(state_map, operation_name="manual"):
+    """Create a timestamped backup of the current state_map"""
+    try:
+        import datetime
+        import shutil
+
+        # Ensure backup directory exists
+        os.makedirs(STATE_MAP_BACKUP_DIR, exist_ok=True)
+
+        # Create timestamped filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"state_map_{operation_name}_{timestamp}.json"
+        backup_path = os.path.join(STATE_MAP_BACKUP_DIR, backup_filename)
+
+        # Convert to serializable format and save
+        serializable_state = {str(k): v for k, v in state_map.items()}
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_state, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+        print(f"📁 [BACKUP] Created timestamped backup: {backup_filename}")
+
+        # Clean up old backups
+        cleanup_old_backups()
+
+        return backup_path
+
+    except Exception as e:
+        print(f"❌ [BACKUP] Failed to create timestamped backup: {e}")
+        return None
+
+def cleanup_old_backups():
+    """Clean up old backup files, keeping only the most recent ones"""
+    try:
+        if not os.path.exists(STATE_MAP_BACKUP_DIR):
+            return
+
+        # Get all backup files
+        backup_files = []
+        for filename in os.listdir(STATE_MAP_BACKUP_DIR):
+            if filename.startswith("state_map_") and filename.endswith(".json"):
+                filepath = os.path.join(STATE_MAP_BACKUP_DIR, filename)
+                if os.path.isfile(filepath):
+                    backup_files.append((os.path.getmtime(filepath), filepath))
+
+        # Sort by modification time (newest first)
+        backup_files.sort(reverse=True, key=lambda x: x[0])
+
+        # Remove old backups
+        if len(backup_files) > MAX_BACKUP_FILES:
+            for _, filepath in backup_files[MAX_BACKUP_FILES:]:
+                try:
+                    os.remove(filepath)
+                    print(f"🗑️ [BACKUP] Removed old backup: {os.path.basename(filepath)}")
+                except Exception as e:
+                    print(f"⚠️ [BACKUP] Failed to remove old backup {filepath}: {e}")
+
+    except Exception as e:
+        print(f"❌ [BACKUP] Error during backup cleanup: {e}")
+
+async def backup_before_modification(operation_name="unknown"):
+    """Create a backup before making modifications to state_map"""
+    async with state_map_lock:
+        return create_timestamped_backup(dict(state_map), operation_name)
+
+def restore_from_backup(backup_path):
+    """Restore state_map from a backup file"""
+    try:
+        if not os.path.exists(backup_path):
+            print(f"❌ [RESTORE] Backup file not found: {backup_path}")
+            return False
+
+        print(f"🔄 [RESTORE] Restoring from backup: {os.path.basename(backup_path)}")
+
+        with open(backup_path, 'r', encoding='utf-8') as f:
+            loaded_state = json.load(f)
+
+        # Convert back to integer keys
+        restored_state = {}
+        for k, v in loaded_state.items():
+            try:
+                int_key = int(k)
+                restored_state[int_key] = v
+            except (ValueError, TypeError) as key_error:
+                print(f"⚠️ [RESTORE] Skipping invalid key '{k}': {key_error}")
+                continue
+
+        # Replace current state_map
+        global state_map
+        state_map = restored_state
+
+        print(f"🔄 [RESTORE] Successfully restored {len(restored_state)} entries from backup")
+        return True
+
+    except Exception as e:
+        print(f"❌ [RESTORE] Failed to restore from backup: {e}")
+        return False
+
+def list_available_backups():
+    """List all available backup files"""
+    try:
+        if not os.path.exists(STATE_MAP_BACKUP_DIR):
+            return []
+
+        backups = []
+        for filename in os.listdir(STATE_MAP_BACKUP_DIR):
+            if filename.startswith("state_map_") and filename.endswith(".json"):
+                filepath = os.path.join(STATE_MAP_BACKUP_DIR, filename)
+                if os.path.isfile(filepath):
+                    backups.append((os.path.getmtime(filepath), filename))
+
+        # Sort by modification time (newest first)
+        backups.sort(reverse=True, key=lambda x: x[0])
+
+        return [filename for _, filename in backups]
+
+    except Exception as e:
+        print(f"❌ [BACKUP] Error listing backups: {e}")
+        return []
+
 message_queue = asyncio.Queue()
 account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
+
+# Periodic saving configuration
+PERIODIC_SAVE_INTERVAL = 300  # Save every 5 minutes
+periodic_save_task = None
+
+async def periodic_state_map_saver():
+    """Background task that periodically saves state_map to prevent data loss"""
+    global periodic_save_task
+
+    print(f"💾 [PERIODIC SAVE] Starting periodic state_map saver (interval: {PERIODIC_SAVE_INTERVAL}s)")
+
+    while True:
+        try:
+            await asyncio.sleep(PERIODIC_SAVE_INTERVAL)
+
+            # Check if state_map has any entries before saving
+            if len(state_map) > 0:
+                print(f"💾 [PERIODIC SAVE] Saving state_map with {len(state_map)} entries...")
+                save_success = save_state_map_sync(state_map)
+                if save_success:
+                    print(f"💾 [PERIODIC SAVE] Periodic save completed successfully")
+                else:
+                    print(f"⚠️ [PERIODIC SAVE] Periodic save failed")
+            else:
+                print(f"💾 [PERIODIC SAVE] Skipping save - state_map is empty")
+
+        except asyncio.CancelledError:
+            print(f"💾 [PERIODIC SAVE] Task cancelled, performing final save...")
+            # Perform a final save before shutting down
+            try:
+                if len(state_map) > 0:
+                    save_success = save_state_map_sync(state_map)
+                    if save_success:
+                        print(f"💾 [PERIODIC SAVE] Final save completed")
+                    else:
+                        print(f"⚠️ [PERIODIC SAVE] Final save failed")
+            except Exception as final_save_error:
+                print(f"❌ [PERIODIC SAVE] Error during final save: {final_save_error}")
+            break
+
+        except Exception as e:
+            print(f"❌ [PERIODIC SAVE] Error in periodic save task: {e}")
+            # Continue running despite errors to avoid stopping the periodic saves
+            await asyncio.sleep(60)  # Wait a bit before retrying
+
+async def start_periodic_saver():
+    """Start the periodic state_map saving task"""
+    global periodic_save_task
+
+    if periodic_save_task is None or periodic_save_task.done():
+        periodic_save_task = asyncio.create_task(periodic_state_map_saver())
+        print(f"💾 [PERIODIC SAVE] Periodic saver task started")
+        return periodic_save_task
+    else:
+        print(f"💾 [PERIODIC SAVE] Periodic saver task already running")
+        return periodic_save_task
+
+async def stop_periodic_saver():
+    """Stop the periodic state_map saving task"""
+    global periodic_save_task
+
+    if periodic_save_task is not None and not periodic_save_task.done():
+        print(f"💾 [PERIODIC SAVE] Stopping periodic saver task...")
+        periodic_save_task.cancel()
+        try:
+            await periodic_save_task
+            print(f"💾 [PERIODIC SAVE] Periodic saver task stopped successfully")
+        except asyncio.CancelledError:
+            print(f"💾 [PERIODIC SAVE] Periodic saver task was cancelled")
+    else:
+        print(f"💾 [PERIODIC SAVE] Periodic saver task was not running")
+
+# Global flag for shutdown
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Signal handler for graceful shutdown"""
+    global shutdown_requested
+    if not shutdown_requested:
+        shutdown_requested = True
+        print(f"\n🛑 [SIGNAL] Received signal {signum}, initiating graceful shutdown...")
+        # Create a task to handle the shutdown asynchronously
+        asyncio.create_task(graceful_shutdown(signum))
+
+async def graceful_shutdown(signum):
+    """Perform graceful shutdown with state saving"""
+    try:
+        print(f"🛑 [SHUTDOWN] Starting graceful shutdown sequence...")
+
+        # Stop periodic saver first
+        print(f"🛑 [SHUTDOWN] Stopping periodic saver...")
+        await stop_periodic_saver()
+
+        # Perform final state_map save
+        print(f"🛑 [SHUTDOWN] Performing final state_map save...")
+        if len(state_map) > 0:
+            save_success = save_state_map_sync(state_map)
+            if save_success:
+                print(f"🛑 [SHUTDOWN] Final state_map save completed successfully")
+            else:
+                print(f"⚠️ [SHUTDOWN] Final state_map save failed")
+        else:
+            print(f"🛑 [SHUTDOWN] No state_map entries to save")
+
+        print(f"🛑 [SHUTDOWN] Graceful shutdown completed for signal {signum}")
+
+    except Exception as e:
+        print(f"❌ [SHUTDOWN] Error during graceful shutdown: {e}")
+    finally:
+        # Force exit after cleanup
+        print(f"🛑 [SHUTDOWN] Exiting application...")
+        os._exit(0)
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown"""
+    try:
+        # Handle SIGINT (Ctrl+C)
+        signal.signal(signal.SIGINT, signal_handler)
+        print(f"🛑 [SIGNALS] SIGINT handler registered")
+
+        # Handle SIGTERM (termination signal)
+        signal.signal(signal.SIGTERM, signal_handler)
+        print(f"🛑 [SIGNALS] SIGTERM handler registered")
+
+        # Handle SIGHUP (hangup) on Unix systems
+        try:
+            sighup_signal = getattr(signal, 'SIGHUP', None)
+            if sighup_signal is not None:
+                signal.signal(sighup_signal, signal_handler)
+                print(f"🛑 [SIGNALS] SIGHUP handler registered")
+        except (AttributeError, ValueError):
+            pass  # SIGHUP not available on this platform
+
+    except ValueError as e:
+        print(f"⚠️ [SIGNALS] Could not setup signal handlers: {e}")
+        print(f"⚠️ [SIGNALS] Signal handlers may not work properly on this platform")
+    except Exception as e:
+        print(f"❌ [SIGNALS] Unexpected error setting up signal handlers: {e}")
 
 class AdaptiveDelay:
     """
@@ -1293,10 +1687,15 @@ async def telegram_bot_main(response_queues):
             print(f"🐛 [DEBUG] Looking up state_map for reply_to_message_id: {reply_to_id}")
             print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
             print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
-            print(f"🐛 [DEBUG] Key exists in state_map: {reply_to_id in state_map}")
-            
-            if reply_to_id in state_map:
-                state = state_map[reply_to_id]
+            key_exists = await check_state_map_key(reply_to_id)
+            print(f"🐛 [DEBUG] Key exists in state_map: {key_exists}")
+
+            if key_exists:
+                state = await get_state_map_entry(reply_to_id)
+                if state is None:
+                    print(f"⚠️ [TELEGRAM] State lookup returned None for reply_to_id: {reply_to_id}")
+                    await message.reply("❌ Error: No se pudo encontrar la información del chat original")
+                    return
                 print(f"🐛 [DEBUG] ✅ STATE_MAP LOOKUP SUCCESS - Found: {state}")
                 print(f"🐛 [DEBUG] 📝 Creating response_msg - message.message_id: {message.message_id}")
                 response_msg = {
@@ -1357,10 +1756,15 @@ async def telegram_bot_main(response_queues):
             reply_to_id = message.reply_to_message.message_id
             print(f"🐛 [DEBUG] Looking up state_map for reply_to_message_id (media): {reply_to_id}")
             print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
-            print(f"🐛 [DEBUG] Key exists in state_map: {reply_to_id in state_map}")
-            
-            if reply_to_id in state_map:
-                state = state_map[reply_to_id]
+            key_exists = await check_state_map_key(reply_to_id)
+            print(f"🐛 [DEBUG] Key exists in state_map: {key_exists}")
+
+            if key_exists:
+                state = await get_state_map_entry(reply_to_id)
+                if state is None:
+                    print(f"⚠️ [TELEGRAM] State lookup returned None for reply_to_id: {reply_to_id}")
+                    await message.reply("❌ Error: No se pudo encontrar la información del chat original")
+                    return
                 print(f"🐛 [DEBUG] ✅ STATE_MAP LOOKUP SUCCESS (media) - Found: {state}")
                 
                 if message.photo:
@@ -1474,7 +1878,10 @@ async def telegram_bot_main(response_queues):
                                 'chat_original': content["sender"]
                             }
                             state_map[sent_msg.message_id] = state_entry
-                            
+                            save_success = await save_state_map(state_map)  # Persist to disk after state_map update
+                            if not save_success:
+                                print(f"⚠️ [STATE] Failed to persist state_map after text message")
+
                             print(f"🐛 [DEBUG] ✅ STATE_MAP SAVED - Key: {sent_msg.message_id}, Value: {state_entry}")
                             print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
                             print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
@@ -1571,8 +1978,10 @@ async def telegram_bot_main(response_queues):
                                     'chat_original': content["sender"]
                                 }
                                 state_map[sent_msg.message_id] = state_entry
-                                save_state_map(state_map)  # Persist to disk
-                                
+                                save_success = await save_state_map(state_map)  # Persist to disk
+                                if not save_success:
+                                    print(f"⚠️ [STATE] Failed to persist state_map after media message")
+
                                 print(f"🐛 [DEBUG] ✅ STATE_MAP SAVED - Key: {sent_msg.message_id}, Value: {state_entry}")
                                 print(f"🐛 [DEBUG] Current state_map size: {len(state_map)} entries")
                                 print(f"🐛 [DEBUG] Current state_map keys: {list(state_map.keys())}")
@@ -1620,6 +2029,13 @@ async def telegram_bot_main(response_queues):
 
 async def main():
     print("🚀 [MAIN] Starting bridge application...")
+
+    # Start periodic state_map saving
+    periodic_task = await start_periodic_saver()
+
+    # Setup signal handlers for graceful shutdown
+    setup_signal_handlers()
+
     print(f"🚀 [MAIN] TELEGRAM_TOKEN configured: {'Yes' if TELEGRAM_TOKEN else 'No'}")
     print(f"🚀 [MAIN] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
     
@@ -1650,6 +2066,11 @@ async def main():
     except Exception as gather_error:
         print(f"🚀 [MAIN] ERROR in task execution: {gather_error}")
         raise gather_error
+    finally:
+        # Stop periodic saver on shutdown
+        print("🚀 [MAIN] Shutting down periodic saver...")
+        await stop_periodic_saver()
+        print("🚀 [MAIN] Periodic saver stopped")
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -24,3 +24,5 @@ downloads/
 # User-specific files
 user_data/
 state_map.json
+state_backups/
+state_backups.original_backup/
