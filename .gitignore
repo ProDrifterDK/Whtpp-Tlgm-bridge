@@ -18,6 +18,7 @@ docker-compose.override.yml
 
 # Temporary files
 downloads/
+.mypy_cache/
 *.tmp
 *.log
 
