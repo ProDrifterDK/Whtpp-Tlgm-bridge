@@ -448,7 +448,7 @@ account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
 
 # Periodic saving configuration
-PERIODIC_SAVE_INTERVAL = 300  # Save every 5 minutes
+PERIODIC_SAVE_INTERVAL = 86400  # Save every 5 minutes
 periodic_save_task: asyncio.Task[None] | None = None
 
 async def periodic_state_map_saver():
