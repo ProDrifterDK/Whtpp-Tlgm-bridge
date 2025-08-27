@@ -196,6 +196,106 @@ class AdaptiveDelay:
 # Initialize adaptive delay system
 adaptive_delay = AdaptiveDelay(base_delay=3, max_delay=300, active_delay=0.5)
 
+async def progressive_wait_for_search_results(page, account_id, search_term, max_attempts=5):
+    """
+    Progressive wait for search results with multiple timeout attempts.
+    Returns (success, chat_count, error_message)
+    """
+    wait_times = [0.5, 1.0, 2.0, 3.0, 5.0]  # Progressive wait times
+
+    for attempt in range(max_attempts):
+        wait_time = wait_times[min(attempt, len(wait_times) - 1)]
+        print(f"🔍 [{account_id}] SEARCH ATTEMPT {attempt + 1}: Waiting {wait_time}s for results...")
+
+        await asyncio.sleep(wait_time)
+
+        # Check for loading indicators first
+        loading_selectors = [
+            '[aria-label*="Cargando"]',
+            '[aria-label*="Loading"]',
+            'div[data-testid="loading"]',
+            '.loading',
+            '[role="progressbar"]'
+        ]
+
+        loading_found = False
+        for loading_selector in loading_selectors:
+            try:
+                loading_element = await page.query_selector(loading_selector)
+                if loading_element:
+                    print(f"⏳ [{account_id}] Loading indicator found: {loading_selector}")
+                    loading_found = True
+                    # Wait for loading to disappear
+                    await page.wait_for_selector(loading_selector, state='hidden', timeout=10000)
+                    print(f"✅ [{account_id}] Loading indicator disappeared")
+                    break
+            except:
+                continue
+
+        # Alternative selectors for search results
+        result_selectors = [
+            "div[aria-label='Lista de chats'] div[role='listitem']",  # Primary Spanish
+            "div[aria-label='Chat list'] div[role='listitem']",      # English
+            "div[aria-label='Chats'] div[role='listitem']",         # Simple English
+            "div[aria-label*='Lista'] div[role='listitem']",        # Contains "Lista"
+            "[role='grid'] [role='listitem']",                      # Grid-based
+            "div[data-testid='chat-list'] div[role='listitem']",    # Test ID
+            "#pane-side div[role='listitem']",                      # Side pane
+            "div[class*='chat-list'] div[role='listitem']",         # Class-based
+        ]
+
+        for selector_idx, chat_selector in enumerate(result_selectors):
+            try:
+                chat_elements = await page.query_selector_all(chat_selector)
+                chat_count = len(chat_elements)
+
+                if chat_count > 0:
+                    print(f"✅ [{account_id}] SUCCESS: Found {chat_count} chats with selector {selector_idx + 1}: {chat_selector}")
+                    return True, chat_count, None
+
+                print(f"🔍 [{account_id}] Selector {selector_idx + 1} returned 0 results: {chat_selector}")
+
+            except Exception as selector_error:
+                print(f"⚠️ [{account_id}] Selector {selector_idx + 1} failed: {chat_selector} - {str(selector_error)}")
+                continue
+
+        print(f"❌ [{account_id}] ATTEMPT {attempt + 1} FAILED: No search results found after {wait_time}s")
+
+    # All attempts failed
+    return False, 0, f"No search results found for '{search_term}' after {max_attempts} attempts with progressive waits"
+
+async def wait_for_chat_list_change(page, account_id, initial_count, timeout=10):
+    """
+    Wait for chat list to change count after search operation.
+    Returns (changed, new_count)
+    """
+    try:
+        print(f"📊 [{account_id}] MONITORING: Waiting for chat list change from {initial_count} items...")
+
+        # Get initial chat count
+        chat_selector = "div[aria-label='Lista de chats'] div[role='listitem']"
+        initial_elements = await page.query_selector_all(chat_selector)
+        initial_count = len(initial_elements)
+
+        # Wait for count to change
+        start_time = asyncio.get_event_loop().time()
+
+        while (asyncio.get_event_loop().time() - start_time) < timeout:
+            await asyncio.sleep(0.5)
+            current_elements = await page.query_selector_all(chat_selector)
+            current_count = len(current_elements)
+
+            if current_count != initial_count:
+                print(f"📊 [{account_id}] CHAT LIST CHANGED: {initial_count} → {current_count}")
+                return True, current_count
+
+        print(f"⏰ [{account_id}] TIMEOUT: Chat list count unchanged after {timeout}s")
+        return False, initial_count
+
+    except Exception as e:
+        print(f"⚠️ [{account_id}] Error monitoring chat list change: {str(e)}")
+        return False, initial_count
+
 async def whatsapp_listener(account_id, user_data_dir, response_queue):
     async with async_playwright() as p:
         # Enhanced browser configuration to bypass WhatsApp Web browser compatibility checks
@@ -447,36 +547,97 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         await search_element.fill(response_msg["chat_target"])
                         print(f"  ✅ Search box filled with: '{response_msg['chat_target']}'")
                         
-                        # Step 2: Wait for search results and click chat
+                        # Step 2: Enhanced search with progressive wait and fallback mechanisms
                         print(f"👆 [{account_id}] CLICK STEP: Looking for chat result...")
-                        await asyncio.sleep(2)  # Increased wait time for search results
-                        
-                        # Look for chat results
-                        chat_elements = await page.query_selector_all(CHAT_RESULT)
-                        print(f"  📊 Found {len(chat_elements)} potential chats")
-                        
+
+                        # Get initial chat count for fallback mechanism
+                        initial_chat_selector = "div[aria-label='Lista de chats'] div[role='listitem']"
+                        initial_chats = await page.query_selector_all(initial_chat_selector)
+                        initial_count = len(initial_chats)
+                        print(f"  📊 Initial chat count: {initial_count}")
+
+                        # Use progressive wait for search results
+                        search_success, chat_count, search_error = await progressive_wait_for_search_results(
+                            page, account_id, response_msg["chat_target"]
+                        )
+
+                        if not search_success:
+                            # Fallback: Wait for chat list to change count
+                            print(f"🔄 [{account_id}] FALLBACK: Monitoring chat list changes...")
+                            list_changed, new_count = await wait_for_chat_list_change(page, account_id, initial_count, timeout=5)
+
+                            if not list_changed:
+                                # Final fallback: Try direct search result lookup
+                                print(f"🔍 [{account_id}] FINAL FALLBACK: Direct search result lookup...")
+                                chat_elements = await page.query_selector_all(CHAT_RESULT)
+                                chat_count = len(chat_elements)
+                                print(f"  📊 Found {chat_count} potential chats (fallback)")
+
+                                if chat_count == 0:
+                                    raise Exception(f"Search failed for '{response_msg['chat_target']}': {search_error}")
+                            else:
+                                chat_count = new_count
+                                print(f"  📊 Using fallback chat count: {chat_count}")
+
+                        # Look for target chat among results
                         target_found = False
                         target_name_clean = response_msg["chat_target"].replace('✨', '').replace('❤️', '').strip()
-                        
-                        for i, chat_element in enumerate(chat_elements):
+
+                        # Alternative selectors for finding chats
+                        chat_selectors = [
+                            "div[aria-label='Lista de chats'] div[role='listitem']",
+                            "div[aria-label='Chat list'] div[role='listitem']",
+                            "div[aria-label='Chats'] div[role='listitem']",
+                            "[role='grid'] [role='listitem']",
+                            "div[data-testid='chat-list'] div[role='listitem']",
+                        ]
+
+                        for selector_attempt, chat_selector in enumerate(chat_selectors):
+                            if target_found:
+                                break
+
                             try:
-                                chat_text = await chat_element.inner_text()
-                                chat_text_clean = chat_text.replace('✨', '').replace('❤️', '').strip()
-                                print(f"    📝 Chat {i+1} text: '{chat_text[:30]}...'")
-                                
-                                if target_name_clean.lower() in chat_text_clean.lower():
-                                    print(f"  ✅ MATCH FOUND: Chat {i+1} matches target '{response_msg['chat_target']}'")
-                                    await chat_element.click()
-                                    target_found = True
-                                    break
-                                else:
-                                    print(f"    ❌ No match: '{target_name_clean}' not found in '{chat_text_clean[:30]}...'")
-                            except Exception as chat_error:
-                                print(f"    ⚠️ Error analyzing chat {i+1}: {chat_error}")
+                                chat_elements = await page.query_selector_all(chat_selector)
+                                print(f"    🔍 [{account_id}] Trying selector {selector_attempt + 1}, found {len(chat_elements)} chats")
+
+                                for i, chat_element in enumerate(chat_elements):
+                                    try:
+                                        chat_text = await chat_element.inner_text()
+                                        chat_text_clean = chat_text.replace('✨', '').replace('❤️', '').strip()
+                                        print(f"      📝 Chat {i+1} text: '{chat_text[:30]}...'")
+
+                                        if target_name_clean.lower() in chat_text_clean.lower():
+                                            print(f"      ✅ MATCH FOUND: Chat {i+1} matches target '{response_msg['chat_target']}'")
+                                            await chat_element.click()
+                                            target_found = True
+                                            break
+                                        else:
+                                            print(f"      ❌ No match: '{target_name_clean}' not found in '{chat_text_clean[:30]}...'")
+                                    except Exception as chat_error:
+                                        print(f"      ⚠️ Error analyzing chat {i+1}: {chat_error}")
+                                        continue
+
+                            except Exception as selector_error:
+                                print(f"    ⚠️ [{account_id}] Selector {selector_attempt + 1} failed: {str(selector_error)}")
                                 continue
-                        
+
                         if not target_found:
-                            raise Exception(f"Could not find chat '{response_msg['chat_target']}' in {len(chat_elements)} search results")
+                            # Enhanced diagnostic logging
+                            print(f"❌ [{account_id}] DIAGNOSTIC: Search failed for '{response_msg['chat_target']}'")
+                            print(f"  📊 Total chats found: {chat_count}")
+                            print(f"  🔍 Searched for: '{target_name_clean}'")
+
+                            # Try to get page content for debugging
+                            try:
+                                page_content = await page.content()
+                                debug_file = f"./debug_search_failed_{account_id}.html"
+                                with open(debug_file, 'w', encoding='utf-8') as f:
+                                    f.write(page_content)
+                                print(f"  📄 Debug HTML saved: {debug_file}")
+                            except Exception as debug_error:
+                                print(f"  ⚠️ Could not save debug HTML: {str(debug_error)}")
+
+                            raise Exception(f"Could not find chat '{response_msg['chat_target']}' in {chat_count} search results")
                         
                         # Step 3: Wait for navigation
                         print(f"⏳ [{account_id}] NAVIGATION: Waiting for chat to load...")
@@ -502,9 +663,30 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         print(f"  ✅ Send button clicked successfully")
                         
                         print(f"✅ [{account_id}] TEXT MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
-                        
+
+                        # Send success confirmation
+                        await message_queue.put(('status', {
+                            "text": f"✅ Message sent successfully!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text",
+                            "original_message_id": response_msg.get("telegram_message_id"),
+                            "status_type": "success",
+                            "account_id": account_id,
+                            "chat_target": response_msg['chat_target']
+                        }))
+                        print(f"📤 [{account_id}] CONFIRMATION: Success status sent to queue")
+
                     except Exception as send_error:
                         print(f"❌ [{account_id}] SEND ERROR: {send_error}")
+
+                        # Send failure confirmation
+                        await message_queue.put(('status', {
+                            "text": f"❌ Message failed to send!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text\n⚠️ Error: {str(send_error)}",
+                            "original_message_id": response_msg.get("telegram_message_id"),
+                            "status_type": "failure",
+                            "account_id": account_id,
+                            "chat_target": response_msg['chat_target'],
+                            "error": str(send_error)
+                        }))
+                        print(f"📤 [{account_id}] CONFIRMATION: Failure status sent to queue")
                         raise send_error
                 elif response_msg["type"] == "media":
                     print(f"📎 [{account_id}] SENDING MEDIA: Starting media message send process...")
@@ -630,9 +812,31 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                             print(f"  ⚠️ Could not remove file: {cleanup_error}")
                         
                         print(f"✅ [{account_id}] MEDIA MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
-                        
+
+                        # Send success confirmation for media
+                        await message_queue.put(('status', {
+                            "text": f"✅ Media sent successfully!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📎 Type: Media",
+                            "original_message_id": response_msg.get("telegram_message_id"),
+                            "status_type": "success",
+                            "account_id": account_id,
+                            "chat_target": response_msg['chat_target']
+                        }))
+                        print(f"📤 [{account_id}] CONFIRMATION: Media success status sent to queue")
+
                     except Exception as send_error:
                         print(f"❌ [{account_id}] MEDIA SEND ERROR: {send_error}")
+
+                        # Send failure confirmation for media
+                        await message_queue.put(('status', {
+                            "text": f"❌ Media failed to send!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📎 Type: Media\n⚠️ Error: {str(send_error)}",
+                            "original_message_id": response_msg.get("telegram_message_id"),
+                            "status_type": "failure",
+                            "account_id": account_id,
+                            "chat_target": response_msg['chat_target'],
+                            "error": str(send_error)
+                        }))
+                        print(f"📤 [{account_id}] CONFIRMATION: Media failure status sent to queue")
+
                         raise send_error
             except asyncio.QueueEmpty:
                 pass
@@ -1089,7 +1293,8 @@ async def telegram_bot_main(response_queues):
                 response_msg = {
                     "chat_target": state["chat_original"],
                     "text": message.text,
-                    "type": "text"
+                    "type": "text",
+                    "account": state["account"]
                 }
                 print(f"🐛 [DEBUG] Sending response to queue: {response_msg}")
                 await response_queues[state["account"]].put(response_msg)
@@ -1174,7 +1379,8 @@ async def telegram_bot_main(response_queues):
                         "type": "media",
                         "file_path": file_path,
                         "file_type": file_type,
-                        "chat_target": state["chat_original"]
+                        "chat_target": state["chat_original"],
+                        "account": state["account"]
                     })
                     
                     # Success feedback
@@ -1353,8 +1559,20 @@ async def telegram_bot_main(response_queues):
                     elif content["type"] == "status":
                         print(f"📤 [TELEGRAM] Sending status message to Telegram...")
                         try:
-                            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
-                            print(f"✅ [TELEGRAM] Status message sent successfully!")
+                            # Check if this is a reply to an original message
+                            reply_to_message_id = content.get("original_message_id")
+                            if reply_to_message_id:
+                                # Send as reply to original message
+                                await bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=content["text"],
+                                    reply_to_message_id=reply_to_message_id
+                                )
+                                print(f"✅ [TELEGRAM] Status reply sent successfully to message {reply_to_message_id}!")
+                            else:
+                                # Send as regular message
+                                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
+                                print(f"✅ [TELEGRAM] Status message sent successfully!")
                         except Exception as telegram_error:
                             print(f"❌ [TELEGRAM] Failed to send status message: {telegram_error}")
                 else:
