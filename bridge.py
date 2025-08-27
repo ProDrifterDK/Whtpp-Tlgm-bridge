@@ -9,6 +9,7 @@ from aiogram.types import ContentType
 from dotenv import load_dotenv
 from aiogram.filters import Command
 from aiogram import F
+from typing import Any
 
 # Load environment variables
 load_dotenv()
@@ -346,13 +347,13 @@ def list_available_backups():
         print(f"❌ [BACKUP] Error listing backups: {e}")
         return []
 
-message_queue = asyncio.Queue()
+message_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
 account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
 
 # Periodic saving configuration
 PERIODIC_SAVE_INTERVAL = 300  # Save every 5 minutes
-periodic_save_task = None
+periodic_save_task: asyncio.Task[None] | None = None
 
 async def periodic_state_map_saver():
     """Background task that periodically saves state_map to prevent data loss"""
@@ -2039,12 +2040,12 @@ async def main():
     print(f"🚀 [MAIN] TELEGRAM_TOKEN configured: {'Yes' if TELEGRAM_TOKEN else 'No'}")
     print(f"🚀 [MAIN] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
     
-    response_queues = {
+    response_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {
         "WhatsApp-1": asyncio.Queue(),
         "WhatsApp-2": asyncio.Queue()
     }
     tasks = []
-    
+
     # Start WhatsApp listeners
     print("🚀 [MAIN] Starting WhatsApp listeners...")
     for i, account_id in enumerate(account_ids):
