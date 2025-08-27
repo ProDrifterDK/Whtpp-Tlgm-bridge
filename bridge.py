@@ -665,6 +665,8 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         print(f"✅ [{account_id}] TEXT MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
 
                         # Send success confirmation
+                        print(f"🐛 [DEBUG] 📤 STATUS MSG: response_msg fields: {list(response_msg.keys())}")
+                        print(f"🐛 [DEBUG] 📤 STATUS MSG: telegram_message_id value: {response_msg.get('telegram_message_id')}")
                         await message_queue.put(('status', {
                             "text": f"✅ Message sent successfully!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text",
                             "original_message_id": response_msg.get("telegram_message_id"),
@@ -678,6 +680,8 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         print(f"❌ [{account_id}] SEND ERROR: {send_error}")
 
                         # Send failure confirmation
+                        print(f"🐛 [DEBUG] ❌ TEXT FAILURE: response_msg fields: {list(response_msg.keys())}")
+                        print(f"🐛 [DEBUG] ❌ TEXT FAILURE: telegram_message_id value: {response_msg.get('telegram_message_id')}")
                         await message_queue.put(('status', {
                             "text": f"❌ Message failed to send!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text\n⚠️ Error: {str(send_error)}",
                             "original_message_id": response_msg.get("telegram_message_id"),
@@ -814,6 +818,8 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         print(f"✅ [{account_id}] MEDIA MESSAGE SENT: Process completed for '{response_msg['chat_target']}'")
 
                         # Send success confirmation for media
+                        print(f"🐛 [DEBUG] 📤 MEDIA STATUS MSG: response_msg fields: {list(response_msg.keys())}")
+                        print(f"🐛 [DEBUG] 📤 MEDIA STATUS MSG: telegram_message_id value: {response_msg.get('telegram_message_id')}")
                         await message_queue.put(('status', {
                             "text": f"✅ Media sent successfully!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📎 Type: Media",
                             "original_message_id": response_msg.get("telegram_message_id"),
@@ -827,6 +833,8 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         print(f"❌ [{account_id}] MEDIA SEND ERROR: {send_error}")
 
                         # Send failure confirmation for media
+                        print(f"🐛 [DEBUG] ❌ MEDIA FAILURE: response_msg fields: {list(response_msg.keys())}")
+                        print(f"🐛 [DEBUG] ❌ MEDIA FAILURE: telegram_message_id value: {response_msg.get('telegram_message_id')}")
                         await message_queue.put(('status', {
                             "text": f"❌ Media failed to send!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📎 Type: Media\n⚠️ Error: {str(send_error)}",
                             "original_message_id": response_msg.get("telegram_message_id"),
@@ -1142,14 +1150,14 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                                 # DIAGNOSTIC: Check for multimedia content before processing as text
                                 print(f"[{account_id}] 🔍 MULTIMEDIA CHECK: Looking for images/media in message {msg_index + 1}...")
                                 
-                                # Check for images
+                                # Check for images - PRIORITIZE FULL RESOLUTION over thumbnails
                                 image_selectors = [
-                                    'div[aria-label="Abrir foto"]',              # Spanish: Open photo
-                                    'div[aria-label="Open photo"]',              # English: Open photo
-                                    'img[src*="blob:"]',                         # Blob URLs (WhatsApp images)
-                                    'img[src^="data:image"]',                    # Data URIs (thumbnails)
-                                    'div[role="button"][aria-label*="foto"]',    # Photo button (Spanish)
-                                    'div[role="button"][aria-label*="photo"]',   # Photo button (English)
+                                    'div[aria-label="Abrir foto"]',              # Spanish: Open photo (FULL RESOLUTION)
+                                    'div[aria-label="Open photo"]',              # English: Open photo (FULL RESOLUTION)
+                                    'div[role="button"][aria-label*="foto"]',    # Photo button (Spanish) (FULL RESOLUTION)
+                                    'div[role="button"][aria-label*="photo"]',   # Photo button (English) (FULL RESOLUTION)
+                                    'img[src*="blob:"]',                         # Blob URLs (thumbnails - fallback only)
+                                    'img[src^="data:image"]',                    # Data URIs (thumbnails - fallback only)
                                 ]
                                 
                                 has_image = False
@@ -1290,12 +1298,15 @@ async def telegram_bot_main(response_queues):
             if reply_to_id in state_map:
                 state = state_map[reply_to_id]
                 print(f"🐛 [DEBUG] ✅ STATE_MAP LOOKUP SUCCESS - Found: {state}")
+                print(f"🐛 [DEBUG] 📝 Creating response_msg - message.message_id: {message.message_id}")
                 response_msg = {
                     "chat_target": state["chat_original"],
                     "text": message.text,
                     "type": "text",
-                    "account": state["account"]
+                    "account": state["account"],
+                    "telegram_message_id": message.message_id
                 }
+                print(f"🐛 [DEBUG] 📝 response_msg fields: {list(response_msg.keys())}")
                 print(f"🐛 [DEBUG] Sending response to queue: {response_msg}")
                 await response_queues[state["account"]].put(response_msg)
                 
@@ -1375,13 +1386,17 @@ async def telegram_bot_main(response_queues):
                     await bot.download_file(file.file_path, destination=file_path)
                     
                     print(f"🐛 [DEBUG] Sending media response to queue: account={state['account']}, chat_target={state['chat_original']}")
-                    await response_queues[state["account"]].put({
+                    print(f"🐛 [DEBUG] 📎 Creating media response_msg - message.message_id: {message.message_id}")
+                    media_response_msg = {
                         "type": "media",
                         "file_path": file_path,
                         "file_type": file_type,
                         "chat_target": state["chat_original"],
-                        "account": state["account"]
-                    })
+                        "account": state["account"],
+                        "telegram_message_id": message.message_id
+                    }
+                    print(f"🐛 [DEBUG] 📎 media_response_msg fields: {list(media_response_msg.keys())}")
+                    await response_queues[state["account"]].put(media_response_msg)
                     
                     # Success feedback
                     await message.reply(f"✅ {media_type} enviado a {state['chat_original']} vía {state['account']}")
@@ -1432,7 +1447,20 @@ async def telegram_bot_main(response_queues):
                 source, content = await message_queue.get()
                 print(f"📨 [QUEUE CONSUMER] Received message from {source}: {content}")
                 
-                if source == 'whatsapp':
+                if source == 'status':
+                    print(f"📤 [TELEGRAM] Processing status message: {content}")
+                    try:
+                        # Send the detailed status message to Telegram
+                        sent_msg = await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content["text"])
+                        print(f"📤 [TELEGRAM] Status message sent successfully, received message_id: {sent_msg.message_id}")
+
+                        # If this is a reply (has original_message_id), we could add reply logic here
+                        # For now, just send the status as a regular message
+
+                    except Exception as status_error:
+                        print(f"❌ [TELEGRAM] Error sending status message: {status_error}")
+
+                elif source == 'whatsapp':
                     if content["type"] == "text":
                         print(f"📤 [TELEGRAM] Sending text message to Telegram...")
                         print(f"🐛 [DEBUG] About to send message with content: account_id='{content["account_id"]}', sender='{content["sender"]}'")
