@@ -19,6 +19,101 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HEADLESS = os.getenv("HEADLESS", "False").lower() in ("true", "1", "yes")
 
+# Progress indicator system
+PROGRESS_STATES = {
+    "received": "📥 Message received from Telegram",
+    "queued": "⏳ Message queued for WhatsApp processing",
+    "processing": "⚙️ Processing message in WhatsApp",
+    "searching": "🔍 Searching for chat recipient",
+    "navigating": "🧭 Navigating to chat",
+    "typing": "✍️ Typing message",
+    "sending": "📤 Sending message to WhatsApp",
+    "sent": "✅ Message successfully sent to WhatsApp",
+    "forwarding": "🔄 Forwarding to Telegram",
+    "completed": "🎉 Message processing completed",
+    "error": "❌ Error occurred during processing"
+}
+
+# Progress message IDs storage (message_id -> progress_message_id)
+progress_messages = {}
+progress_lock = Lock()
+
+async def send_progress_message(bot: Bot, chat_id: str, message_id: int, state: str, details: str = ""):
+    """Send initial progress message to Telegram chat"""
+    try:
+        progress_text = f"{PROGRESS_STATES.get(state, 'Unknown state')}"
+        if details:
+            progress_text += f"\n{details}"
+
+        async with progress_lock:
+            progress_msg = await bot.send_message(
+                chat_id=chat_id,
+                text=progress_text,
+                reply_to_message_id=message_id
+            )
+            progress_messages[message_id] = progress_msg.message_id
+
+        print(f"📊 [PROGRESS] Sent progress message for {message_id}: {state}")
+        return progress_msg.message_id
+
+    except Exception as e:
+        print(f"⚠️ [PROGRESS] Failed to send progress message: {e}")
+        return None
+
+async def update_progress_message(bot: Bot, chat_id: str, original_message_id: int, state: str, details: str = ""):
+    """Update existing progress message with new state"""
+    try:
+        async with progress_lock:
+            progress_message_id = progress_messages.get(original_message_id)
+            if not progress_message_id:
+                print(f"⚠️ [PROGRESS] No progress message found for {original_message_id}")
+                return False
+
+        progress_text = f"{PROGRESS_STATES.get(state, 'Unknown state')}"
+        if details:
+            progress_text += f"\n{details}"
+
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_message_id,
+            text=progress_text
+        )
+
+        print(f"📊 [PROGRESS] Updated progress for {original_message_id}: {state}")
+
+        # Clean up progress message ID if completed or errored
+        if state in ["completed", "error"]:
+            async with progress_lock:
+                progress_messages.pop(original_message_id, None)
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ [PROGRESS] Failed to update progress message: {e}")
+        return False
+
+async def cleanup_progress_message(bot: Bot, chat_id: str, original_message_id: int):
+    """Clean up progress message from storage"""
+    try:
+        async with progress_lock:
+            progress_messages.pop(original_message_id, None)
+        print(f"🧹 [PROGRESS] Cleaned up progress tracking for {original_message_id}")
+    except Exception as e:
+        print(f"⚠️ [PROGRESS] Failed to cleanup progress message: {e}")
+
+async def send_progress_update(telegram_message_id: int, state: str, details: str = ""):
+    """Send progress update to the progress queue"""
+    try:
+        progress_data = {
+            'telegram_message_id': telegram_message_id,
+            'state': state,
+            'details': details
+        }
+        await progress_queue.put(progress_data)
+        print(f"📊 [PROGRESS] Queued progress update: {telegram_message_id} -> {state}")
+    except Exception as e:
+        print(f"⚠️ [PROGRESS] Failed to queue progress update: {e}")
+
 # Selectors for WhatsApp Web
 SEARCH_BOX = "div[aria-placeholder='Buscar un chat o iniciar uno nuevo']"
 CHAT_RESULT = "div[aria-label='Lista de chats'] div[role='listitem']"
@@ -348,6 +443,7 @@ def list_available_backups():
         return []
 
 message_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 account_ids = ['WhatsApp-1', 'WhatsApp-2']
 user_data_dirs = ['./user_data/wa_profile_1', './user_data/wa_profile_2']
 
@@ -889,6 +985,11 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                 response_msg = response_queue.get_nowait()
                 if response_msg["type"] == "text":
                     print(f"📝 [{account_id}] SENDING TEXT: Starting text message send process...")
+
+                    # Send progress update - processing started
+                    if response_msg.get('telegram_message_id'):
+                        await send_progress_update(response_msg['telegram_message_id'], "processing",
+                                                 f"Processing in {account_id}")
                     
                     try:
                         # Step 0: CRITICAL - Navigate back to chat list first
@@ -988,6 +1089,11 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         ]
 
                         for selector_attempt, chat_selector in enumerate(chat_selectors):
+                            # Send progress update - searching for recipient
+                            if response_msg.get('telegram_message_id'):
+                                await send_progress_update(response_msg['telegram_message_id'], "searching",
+                                                         f"Searching for '{response_msg['chat_target']}' in {account_id}")
+    
                             if target_found:
                                 break
 
@@ -1062,13 +1168,19 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         # Send success confirmation
                         print(f"🐛 [DEBUG] 📤 STATUS MSG: response_msg fields: {list(response_msg.keys())}")
                         print(f"🐛 [DEBUG] 📤 STATUS MSG: telegram_message_id value: {response_msg.get('telegram_message_id')}")
+                        # Send progress update - message sent successfully
+                        if response_msg.get('telegram_message_id'):
+                            await send_progress_update(response_msg['telegram_message_id'], "sent",
+                                                     f"Sent to {response_msg['chat_target']} via {account_id}")
+
                         await message_queue.put(('status', {
                             "text": f"✅ Message sent successfully!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text",
-                            "original_message_id": response_msg.get("telegram_message_id"),
-                            "status_type": "success",
-                            "account_id": account_id,
-                            "chat_target": response_msg['chat_target']
                         }))
+
+                        # Send final progress update - message completed
+                        if response_msg.get('telegram_message_id'):
+                            await send_progress_update(response_msg['telegram_message_id'], "completed",
+                                                     f"Message delivered successfully via {account_id}")
                         print(f"📤 [{account_id}] CONFIRMATION: Success status sent to queue")
 
                     except Exception as send_error:
@@ -1077,6 +1189,11 @@ async def whatsapp_listener(account_id, user_data_dir, response_queue):
                         # Send failure confirmation
                         print(f"🐛 [DEBUG] ❌ TEXT FAILURE: response_msg fields: {list(response_msg.keys())}")
                         print(f"🐛 [DEBUG] ❌ TEXT FAILURE: telegram_message_id value: {response_msg.get('telegram_message_id')}")
+                        # Send progress update - message failed
+                        if response_msg.get('telegram_message_id'):
+                            await send_progress_update(response_msg['telegram_message_id'], "error",
+                                                     f"Failed to send to {response_msg['chat_target']}: {str(send_error)}")
+
                         await message_queue.put(('status', {
                             "text": f"❌ Message failed to send!\n📱 Account: {account_id}\n👤 Target: {response_msg['chat_target']}\n📝 Type: Text\n⚠️ Error: {str(send_error)}",
                             "original_message_id": response_msg.get("telegram_message_id"),
@@ -1682,6 +1799,9 @@ async def telegram_bot_main(response_queues):
     async def handle_text(message: types.Message):
         print(f"🐛 [DEBUG] handle_text called - message_id: {message.message_id}")
         print(f"🐛 [DEBUG] Reply to message: {message.reply_to_message is not None}")
+
+        # Send initial progress message
+        await send_progress_message(bot, TELEGRAM_CHAT_ID, message.message_id, "received")
         
         if message.reply_to_message:
             reply_to_id = message.reply_to_message.message_id
@@ -1849,6 +1969,22 @@ async def telegram_bot_main(response_queues):
         while True:
             try:
                 print("🔄 [QUEUE CONSUMER] Waiting for messages in queue...")
+
+                # Handle progress updates first (non-blocking)
+                try:
+                    progress_update = progress_queue.get_nowait()
+                    telegram_message_id = progress_update.get('telegram_message_id')
+                    state = progress_update.get('state')
+                    details = progress_update.get('details', '')
+
+                    if telegram_message_id and state:
+                        try:
+                            await update_progress_message(bot, TELEGRAM_CHAT_ID, telegram_message_id, state, details)
+                        except Exception as progress_error:
+                            print(f"⚠️ [PROGRESS] Error processing progress update for {telegram_message_id}: {progress_error}")
+                except asyncio.QueueEmpty:
+                    pass  # No progress updates available
+
                 source, content = await message_queue.get()
                 print(f"📨 [QUEUE CONSUMER] Received message from {source}: {content}")
                 
